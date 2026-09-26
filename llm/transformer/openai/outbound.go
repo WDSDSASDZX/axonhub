@@ -1,0 +1,574 @@
+package openai
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"strings"
+
+	"github.com/spf13/cast"
+	"github.com/tidwall/gjson"
+
+	"github.com/looplj/axonhub/llm"
+	"github.com/looplj/axonhub/llm/auth"
+	"github.com/looplj/axonhub/llm/httpclient"
+	"github.com/looplj/axonhub/llm/streams"
+	"github.com/looplj/axonhub/llm/transformer"
+)
+
+// PlatformType represents the platform type for OpenAI API.
+type PlatformType string
+
+const (
+	PlatformOpenAI PlatformType = "openai"
+	PlatformGoogle PlatformType = "google"
+)
+
+// ReasoningField specifies which reasoning field to use in outbound messages.
+type ReasoningField string
+
+const (
+	// ReasoningFieldContent uses reasoning_content field (DeepSeek, Gemini, etc).
+	ReasoningFieldContent ReasoningField = "reasoning_content"
+	// ReasoningFieldReasoning uses reasoning field (NanoGPT, OpenRouter).
+	ReasoningFieldReasoning ReasoningField = "reasoning"
+	// ReasoningFieldNone strips all reasoning fields (Fireworks, bailian, etc).
+	ReasoningFieldNone ReasoningField = "none"
+	// ReasoningFieldAll preserves both reasoning and reasoning_content fields (default).
+	ReasoningFieldAll ReasoningField = "all"
+)
+
+// Config holds all configuration for the OpenAI outbound transformer.
+type Config struct {
+	// Platform configuration
+	PlatformType PlatformType `json:"type"`
+
+	// BaseURL is the base URL for the OpenAI API, required.
+	BaseURL string `json:"base_url,omitempty"`
+
+	// RawURL is whether to use raw URL for requests, default is false.
+	// If true, the request URL will be used as is, without appending the chat completions endpoint.
+	RawURL bool `json:"raw_url,omitempty"`
+
+	// EndpointPath is an optional custom path override for this endpoint.
+	// When set, it replaces the default API path (e.g., "/chat/completions").
+	// Must start with "/". Skips default version normalization when set.
+	EndpointPath string `json:"endpoint_path,omitempty"`
+
+	// APIKeyProvider provides API keys for authentication, required.
+	APIKeyProvider auth.APIKeyProvider `json:"-"`
+
+	// ReasoningField specifies which reasoning field to use in outbound messages.
+	// Use ReasoningFieldContent (default) for DeepSeek/Mimo/Gemini, ReasoningFieldReasoning for NanoGPT/OpenRouter,
+	// or ReasoningFieldNone to strip all reasoning fields.
+	ReasoningField ReasoningField `json:"reasoning_field,omitempty"`
+}
+
+// OutboundTransformer implements transformer.Outbound for OpenAI format.
+type OutboundTransformer struct {
+	config *Config
+}
+
+// NewOutboundTransformer creates a new OpenAI OutboundTransformer with legacy parameters.
+func NewOutboundTransformer(baseURL, apiKey string) (transformer.Outbound, error) {
+	config := &Config{
+		PlatformType:   PlatformOpenAI,
+		BaseURL:        baseURL,
+		APIKeyProvider: auth.NewStaticKeyProvider(apiKey),
+	}
+
+	err := validateConfig(config)
+	if err != nil {
+		return nil, fmt.Errorf("invalid OpenAI transformer configuration: %w", err)
+	}
+
+	return NewOutboundTransformerWithConfig(config)
+}
+
+// NewOutboundTransformerWithConfig creates a new OpenAI OutboundTransformer with unified configuration.
+func NewOutboundTransformerWithConfig(config *Config) (transformer.Outbound, error) {
+	err := validateConfig(config)
+	if err != nil {
+		return nil, fmt.Errorf("invalid OpenAI transformer configuration: %w", err)
+	}
+
+	if strings.HasSuffix(config.BaseURL, "##") {
+		config.RawURL = true
+		config.BaseURL = strings.TrimSuffix(config.BaseURL, "##")
+	} else if !config.RawURL {
+		if config.EndpointPath != "" {
+			config.BaseURL = transformer.NormalizeBaseURL(config.BaseURL, "")
+		} else {
+			config.BaseURL = transformer.NormalizeBaseURL(config.BaseURL, "v1")
+		}
+	}
+
+	return &OutboundTransformer{
+		config: config,
+	}, nil
+}
+
+// validateConfig validates the configuration for the given platform.
+func validateConfig(config *Config) error {
+	if config == nil {
+		return errors.New("config cannot be nil")
+	}
+
+	// Standard OpenAI validation
+	if config.APIKeyProvider == nil {
+		return errors.New("API key provider is required")
+	}
+
+	if config.BaseURL == "" {
+		return errors.New("base URL is required")
+	}
+
+	switch config.PlatformType {
+	case PlatformOpenAI, PlatformGoogle:
+		return nil
+	default:
+		return fmt.Errorf("unsupported platform type: %v", config.PlatformType)
+	}
+}
+
+func (t *OutboundTransformer) APIFormat() llm.APIFormat {
+	return llm.APIFormatOpenAIChatCompletion
+}
+
+// TransformRequest transforms ChatCompletionRequest to Request.
+func (t *OutboundTransformer) TransformRequest(ctx context.Context, llmReq *llm.Request) (*httpclient.Request, error) {
+	if llmReq == nil {
+		return nil, fmt.Errorf("chat completion request is nil")
+	}
+
+	// Validate required fields for chat requests
+	if llmReq.Model == "" {
+		return nil, fmt.Errorf("model is required")
+	}
+
+	//nolint:exhaustive // Checked.
+	switch llmReq.RequestType {
+	case llm.RequestTypeEmbedding:
+		return t.transformEmbeddingRequest(ctx, llmReq)
+	case llm.RequestTypeModeration:
+		return t.transformModerationRequest(ctx, llmReq)
+	case llm.RequestTypeAlphaSearch:
+		return t.transformAlphaSearchRequest(ctx, llmReq)
+	case llm.RequestTypeImage:
+		return t.buildImageGenerationAPIRequest(ctx, llmReq)
+	case llm.RequestTypeVideo:
+		return t.buildVideoGenerationAPIRequest(ctx, llmReq)
+	case llm.RequestTypeSpeech:
+		return t.buildSpeechRequest(ctx, llmReq)
+	case llm.RequestTypeTranscription:
+		return t.buildTranscriptionRequest(ctx, llmReq)
+	case llm.RequestTypeTranslation:
+		return t.buildTranslationRequest(ctx, llmReq)
+	case llm.RequestTypeCompact:
+		return nil, fmt.Errorf("%w: compact is only supported by OpenAI Responses API", transformer.ErrInvalidRequest)
+	case llm.RequestTypeRerank:
+		return nil, fmt.Errorf("%w: rerank is not supported", transformer.ErrInvalidRequest)
+	}
+
+	if len(llmReq.Messages) == 0 {
+		return nil, fmt.Errorf("%w: messages are required", transformer.ErrInvalidRequest)
+	}
+	if err := validateChatDocumentParts(llmReq.Messages); err != nil {
+		return nil, err
+	}
+
+	// Determine which reasoning field to use, default to ReasoningFieldContent.
+	// reasoning_content is the standard field used by most providers (OpenAI o-series,
+	// DeepSeek, Mimo, Gemini, etc.) to return chain-of-thought in responses, and some
+	// require it echoed back in assistant messages. Providers that don't support it
+	// safely ignore the field. Previously defaulted to ReasoningFieldNone to minimize
+	// payload, but this broke providers requiring echo-back (e.g., Mimo #1654).
+	// Channels that want to strip reasoning can explicitly set ReasoningFieldNone in config.
+	reasoningField := t.config.ReasoningField
+	if reasoningField == "" {
+		reasoningField = ReasoningFieldContent
+	}
+
+	// Convert to OpenAI Request format (this strips helper fields)
+	oaiReq := RequestFromLLM(ctx, llmReq, reasoningField)
+	//nolint:exhaustive // Checked.
+	switch t.config.PlatformType {
+	case PlatformOpenAI:
+		stripUnsupportedToolCallExtraContent(oaiReq)
+	}
+
+	body, err := json.Marshal(oaiReq)
+	if err != nil {
+		return nil, fmt.Errorf("failed to transform request: %w", err)
+	}
+
+	// Get API key from provider
+	apiKey := t.config.APIKeyProvider.Get(ctx)
+
+	// Prepare headers
+	headers := make(http.Header)
+	headers.Set("Content-Type", "application/json")
+	headers.Set("Accept", "application/json")
+
+	authConfig := &httpclient.AuthConfig{
+		Type:   "bearer",
+		APIKey: apiKey,
+	}
+
+	// Build platform-specific URL
+	url, err := t.buildFullRequestURL(llmReq)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build platform URL: %w", err)
+	}
+
+	return &httpclient.Request{
+		Method:    http.MethodPost,
+		URL:       url,
+		Headers:   headers,
+		Body:      body,
+		Auth:      authConfig,
+		APIFormat: string(llm.APIFormatOpenAIChatCompletion),
+		Metadata:  nil,
+	}, nil
+}
+
+// TransformResponse transforms Response to ChatCompletionResponse.
+func (t *OutboundTransformer) TransformResponse(
+	ctx context.Context,
+	httpResp *httpclient.Response,
+) (*llm.Response, error) {
+	if httpResp == nil {
+		return nil, fmt.Errorf("http response is nil")
+	}
+
+	// Alpha Search owns its error conversion because the upstream response body
+	// can contain provider-specific details that the generic status check drops.
+	if httpResp.Request != nil && httpResp.Request.APIFormat == string(llm.APIFormatOpenAIAlphaSearch) {
+		return t.transformAlphaSearchResponse(ctx, httpResp)
+	}
+
+	// Check for HTTP error status codes
+	if httpResp.StatusCode >= 400 {
+		return nil, fmt.Errorf("HTTP error %d", httpResp.StatusCode)
+	}
+
+	// Check for empty response body
+	if len(httpResp.Body) == 0 {
+		return nil, fmt.Errorf("response body is empty")
+	}
+
+	// Route to specialized transformers based on request APIFormat
+	if httpResp.Request != nil && httpResp.Request.APIFormat != "" {
+		switch httpResp.Request.APIFormat {
+		case string(llm.APIFormatOpenAIImageGeneration),
+			string(llm.APIFormatOpenAIImageEdit),
+			string(llm.APIFormatOpenAIImageVariation):
+			return transformImageGenerationResponse(httpResp)
+		case string(llm.APIFormatOpenAIEmbedding):
+			return t.transformEmbeddingResponse(ctx, httpResp)
+		case string(llm.APIFormatOpenAIModeration):
+			return t.transformModerationResponse(ctx, httpResp)
+		case string(llm.APIFormatOpenAIVideo):
+			return transformVideoResponse(httpResp)
+		case string(llm.APIFormatOpenAISpeech):
+			return transformSpeechResponse(httpResp)
+		case string(llm.APIFormatOpenAITranscription):
+			return transformTranscriptionResponse(httpResp, llm.APIFormatOpenAITranscription)
+		case string(llm.APIFormatOpenAITranslation):
+			return transformTranscriptionResponse(httpResp, llm.APIFormatOpenAITranslation)
+		}
+	}
+
+	// Parse into OpenAI Response type
+	var oaiResp Response
+
+	err := json.Unmarshal(httpResp.Body, &oaiResp)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal chat completion response: %w", err)
+	}
+
+	// Convert to unified llm.Response
+	return oaiResp.ToLLMResponse(), nil
+}
+
+func (t *OutboundTransformer) TransformStream(ctx context.Context, req *httpclient.Request, stream streams.Stream[*httpclient.StreamEvent]) (streams.Stream[*llm.Response], error) {
+	// Audio APIs use dedicated SSE event schemas; route them to the audio decoder so
+	// chat-completion parsing is not applied to transcript.text.delta / speech.audio.delta.
+	if req != nil {
+		switch req.APIFormat {
+		case string(llm.APIFormatOpenAISpeech):
+			return streams.MapErr(stream, speechStreamChunkTransformFor(req)), nil
+		case string(llm.APIFormatOpenAITranscription):
+			return streams.MapErr(stream, transformTranscriptionStreamChunkFor(llm.APIFormatOpenAITranscription)), nil
+		case string(llm.APIFormatOpenAITranslation):
+			return streams.MapErr(stream, transformTranscriptionStreamChunkFor(llm.APIFormatOpenAITranslation)), nil
+		}
+	}
+
+	// Wrap with NoNil to filter out non-standard events (e.g. inference-cost, cost)
+	// that TransformStreamChunk skips by returning nil.
+	//
+	// Note: TransformStreamChunk only returns nil for events with explicit "choices":[]
+	// in the raw JSON. Events without a choices key (nil slice) are passed through.
+	return streams.NoNil(streams.MapErr(stream, func(event *httpclient.StreamEvent) (*llm.Response, error) {
+		return t.TransformStreamChunk(ctx, event)
+	})), nil
+}
+
+func (t *OutboundTransformer) TransformStreamChunk(
+	ctx context.Context,
+	event *httpclient.StreamEvent,
+) (*llm.Response, error) {
+	if bytes.HasPrefix(event.Data, []byte("[DONE]")) {
+		return llm.DoneResponse, nil
+	}
+
+	// Some providers emit structured error events in-stream (e.g. SSE `event: error`,
+	// or JSON payloads like {"event":"error","data":{...}}). Treat them as stream errors
+	// so the caller can surface them and persistence can mark the request as failed/canceled.
+	if streamErr := parseStreamErrorEvent(event); streamErr != nil {
+		return nil, streamErr
+	}
+
+	// Create a synthetic HTTP response for compatibility with existing logic
+	httpResp := &httpclient.Response{
+		Body: event.Data,
+	}
+
+	resp, err := t.TransformResponse(ctx, httpResp)
+	if err != nil {
+		return nil, err
+	}
+
+	// Normalize empty finish_reason to nil. Some OpenAI-compatible providers
+	// (e.g. Sensenova) emit finish_reason:"" in every stream chunk. An empty
+	// string is semantically identical to "not finished" (null), so this
+	// normalization prevents downstream code from mistaking every chunk for
+	// a terminal event.
+	for i := range resp.Choices {
+		if resp.Choices[i].FinishReason != nil && *resp.Choices[i].FinishReason == "" {
+			resp.Choices[i].FinishReason = nil
+		}
+	}
+
+	// Skip non-standard events with explicit empty choices array and no usage
+	// (e.g. inference-cost, cost) that some providers emit alongside standard chat
+	// completion chunks. Keep the standard OpenAI include_usage terminal chunk,
+	// which is encoded as choices:[] with a non-null usage object.
+	// Returning nil causes NoNil to filter skipped events from the client stream.
+	if choicesVal := gjson.GetBytes(event.Data, "choices"); choicesVal.Exists() && choicesVal.IsArray() && len(choicesVal.Array()) == 0 {
+		usageVal := gjson.GetBytes(event.Data, "usage")
+		if !usageVal.Exists() || usageVal.Raw == "null" {
+			return nil, nil
+		}
+	}
+
+	return resp, nil
+}
+
+func parseStreamErrorEvent(event *httpclient.StreamEvent) *llm.ResponseError {
+	if event == nil {
+		return nil
+	}
+
+	// A provider may emit `event: error` with empty payload. Treat it as an error anyway.
+	if event.Type == "error" && len(event.Data) == 0 {
+		return &llm.ResponseError{
+			Detail: llm.ErrorDetail{
+				Message: "stream error",
+				Type:    "stream_error",
+			},
+		}
+	}
+
+	if len(event.Data) == 0 {
+		return nil
+	}
+
+	root := gjson.ParseBytes(event.Data)
+
+	// Prefer explicit SSE event type when present.
+	if event.Type == "error" || root.Get("event").String() == "error" {
+		// Zai-style (SSE `event: error`): {"error":{"code":"...","message":"..."},"request_id":"..."}
+		// Also tolerate wrapped form: {"event":"error","data":{"error":{...},"request_id":"..."}}
+		errObj := root.Get("error")
+		if !errObj.Exists() {
+			errObj = root.Get("data.error")
+		}
+
+		detail := llm.ErrorDetail{
+			Message: errObj.Get("message").String(),
+			Type:    errObj.Get("type").String(),
+			Code:    errObj.Get("code").String(),
+			Param:   errObj.Get("param").String(),
+		}
+
+		if detail.Message == "" && errObj.Exists() {
+			detail.Message = errObj.String()
+		}
+
+		if detail.Message == "" {
+			detail.Message = "stream error"
+		}
+
+		if rid := root.Get("request_id").String(); rid != "" {
+			detail.RequestID = rid
+		} else if rid := root.Get("data.request_id").String(); rid != "" {
+			detail.RequestID = rid
+		} else if rid := errObj.Get("request_id").String(); rid != "" {
+			detail.RequestID = rid
+		}
+
+		return &llm.ResponseError{Detail: detail}
+	}
+
+	// OpenAI-style: {"error":{...}} or {"error":"..."}
+	ep := root.Get("error")
+	if !ep.Exists() {
+		return nil
+	}
+
+	detail := llm.ErrorDetail{
+		Message: ep.Get("message").String(),
+		Type:    ep.Get("type").String(),
+		Code:    ep.Get("code").String(),
+		Param:   ep.Get("param").String(),
+	}
+	if detail.Message == "" {
+		detail.Message = ep.String()
+	}
+
+	// Best-effort request_id extraction (provider-specific).
+	if rid := root.Get("request_id").String(); rid != "" {
+		detail.RequestID = rid
+	} else if rid := ep.Get("request_id").String(); rid != "" {
+		detail.RequestID = rid
+	}
+
+	return &llm.ResponseError{Detail: detail}
+}
+
+// buildFullRequestURL constructs the appropriate URL based on the platform.
+func (t *OutboundTransformer) buildFullRequestURL(_ *llm.Request) (string, error) {
+	if t.config.RawURL {
+		return t.config.BaseURL, nil
+	}
+
+	if t.config.EndpointPath != "" {
+		return t.config.BaseURL + t.config.EndpointPath, nil
+	}
+
+	return t.config.BaseURL + "/chat/completions", nil
+}
+
+// SetAPIKey updates the API key.
+func (t *OutboundTransformer) SetAPIKey(apiKey string) {
+	t.config.APIKeyProvider = auth.NewStaticKeyProvider(apiKey)
+}
+
+// SetBaseURL updates the base URL.
+func (t *OutboundTransformer) SetBaseURL(baseURL string) {
+	t.config.BaseURL = baseURL
+
+	// Validate configuration after updating base URL
+	err := validateConfig(t.config)
+	if err != nil {
+		panic(fmt.Sprintf("invalid OpenAI transformer configuration after setting base URL: %v", err))
+	}
+}
+
+// SetConfig updates the entire configuration.
+func (t *OutboundTransformer) SetConfig(config *Config) {
+	// Validate configuration before setting
+	err := validateConfig(config)
+	if err != nil {
+		panic(fmt.Sprintf("invalid OpenAI transformer configuration: %v", err))
+	}
+
+	t.config = config
+}
+
+// GetConfig returns the current configuration.
+func (t *OutboundTransformer) GetConfig() *Config {
+	return t.config
+}
+
+func (t *OutboundTransformer) AggregateStreamChunks(
+	ctx context.Context, req *httpclient.Request,
+	chunks []*httpclient.StreamEvent,
+) ([]byte, llm.ResponseMeta, error) {
+	if req != nil {
+		switch req.APIFormat {
+		case string(llm.APIFormatOpenAISpeech):
+			return aggregateSpeechStreamChunks(chunks)
+		case string(llm.APIFormatOpenAITranscription), string(llm.APIFormatOpenAITranslation):
+			return aggregateTranscriptionStreamChunks(chunks)
+		}
+	}
+
+	return AggregateStreamChunks(ctx, chunks, DefaultTransformChunk)
+}
+
+// TransformError transforms HTTP error response to unified error response.
+func (t *OutboundTransformer) TransformError(ctx context.Context, rawErr *httpclient.Error) *llm.ResponseError {
+	if rawErr == nil {
+		return &llm.ResponseError{
+			StatusCode: http.StatusInternalServerError,
+			Detail: llm.ErrorDetail{
+				Message: http.StatusText(http.StatusInternalServerError),
+				Type:    "api_error",
+			},
+		}
+	}
+
+	// Try to parse as OpenAI error format first
+	// Use flexible types for code field to handle both string and number formats
+	// (e.g., NVIDIA returns {"error":{"code":400}} while OpenAI returns {"error":{"code":"invalid_model"}})
+	var openaiError struct {
+		Error struct {
+			Message   string `json:"message"`
+			Type      string `json:"type"`
+			Param     string `json:"param,omitempty"`
+			Code      any    `json:"code"` // Accept both string and number
+			RequestID string `json:"request_id,omitempty"`
+		} `json:"error"`
+		Errors struct {
+			Message   string `json:"message"`
+			Type      string `json:"type"`
+			Param     string `json:"param,omitempty"`
+			Code      any    `json:"code"` // Accept both string and number
+			RequestID string `json:"request_id,omitempty"`
+		} `json:"errors"`
+	}
+
+	err := json.Unmarshal(rawErr.Body, &openaiError)
+	if err == nil && (openaiError.Error.Message != "" || openaiError.Errors.Message != "") {
+		errDetail := openaiError.Error
+		if errDetail.Message == "" {
+			errDetail = openaiError.Errors
+		}
+
+		return &llm.ResponseError{
+			StatusCode: rawErr.StatusCode,
+			Detail: llm.ErrorDetail{
+				Message:   errDetail.Message,
+				Type:      errDetail.Type,
+				Param:     errDetail.Param,
+				Code:      cast.ToString(errDetail.Code),
+				RequestID: errDetail.RequestID,
+			},
+		}
+	}
+
+	// If JSON parsing fails, use the upstream status text
+	return &llm.ResponseError{
+		StatusCode: rawErr.StatusCode,
+		Detail: llm.ErrorDetail{
+			Message: http.StatusText(rawErr.StatusCode),
+			Type:    "api_error",
+		},
+	}
+}

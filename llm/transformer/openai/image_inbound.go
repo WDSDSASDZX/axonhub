@@ -1,0 +1,738 @@
+package openai
+
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"mime"
+	"mime/multipart"
+	"net/http"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/samber/lo"
+
+	"github.com/looplj/axonhub/llm"
+	"github.com/looplj/axonhub/llm/httpclient"
+	"github.com/looplj/axonhub/llm/internal/pkg/xurl"
+	"github.com/looplj/axonhub/llm/streams"
+	transformer "github.com/looplj/axonhub/llm/transformer"
+)
+
+const (
+	defaultMaxImageFileSize = 50 * 1024 * 1024
+	maxImageCount           = 16
+)
+
+var maxImageFileSize = initMaxImageFileSize()
+var maxImageBodySize = maxImageFileSize*maxImageCount + 16*1024*1024
+
+func initMaxImageFileSize() int {
+	if v := os.Getenv("AXONHUB_MAX_IMAGE_FILE_SIZE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+
+	return defaultMaxImageFileSize
+}
+
+var allowedImageTypes = []string{
+	"image/png",
+	"image/jpeg",
+	"image/gif",
+	"image/webp",
+}
+
+// ImageGenerationRequest represents the request structure for image generation API.
+// The Image field accepts a data URL string or an array of data URL strings for
+// image-to-image generation (supported by gpt-image-1).
+type ImageGenerationRequest struct {
+	Prompt            string          `json:"prompt"`
+	Model             string          `json:"model"`
+	N                 *int64          `json:"n,omitempty"`
+	Quality           string          `json:"quality,omitempty"`
+	ResponseFormat    string          `json:"response_format,omitempty"`
+	Size              string          `json:"size,omitempty"`
+	Style             string          `json:"style,omitempty"`
+	User              string          `json:"user,omitempty"`
+	Background        string          `json:"background,omitempty"`
+	OutputFormat      string          `json:"output_format,omitempty"`
+	OutputCompression *int64          `json:"output_compression,omitempty"`
+	Moderation        string          `json:"moderation,omitempty"`
+	PartialImages     *int64          `json:"partial_images,omitempty"`
+	Stream            bool            `json:"stream,omitempty"`
+	Image             json.RawMessage `json:"image,omitempty"`
+}
+
+type ImageInboundTransformer struct {
+	apiFormat llm.APIFormat
+}
+
+func NewImageGenerationInboundTransformer() *ImageInboundTransformer {
+	return &ImageInboundTransformer{
+		apiFormat: llm.APIFormatOpenAIImageGeneration,
+	}
+}
+
+func NewImageEditInboundTransformer() *ImageInboundTransformer {
+	return &ImageInboundTransformer{
+		apiFormat: llm.APIFormatOpenAIImageEdit,
+	}
+}
+
+func NewImageVariationInboundTransformer() *ImageInboundTransformer {
+	return &ImageInboundTransformer{
+		apiFormat: llm.APIFormatOpenAIImageVariation,
+	}
+}
+
+// APIFormat returns the API format of the transformer.
+func (t *ImageInboundTransformer) APIFormat() llm.APIFormat {
+	return t.apiFormat
+}
+
+func (t *ImageInboundTransformer) TransformRequest(ctx context.Context, httpReq *httpclient.Request) (*llm.Request, error) {
+	if httpReq == nil {
+		return nil, fmt.Errorf("%w: http request is nil", transformer.ErrInvalidRequest)
+	}
+
+	if len(httpReq.Body) == 0 {
+		return nil, fmt.Errorf("%w: request body is empty", transformer.ErrInvalidRequest)
+	}
+
+	//nolint:exhaustive // Only image-related API formats are handled here
+	switch t.apiFormat {
+	case llm.APIFormatOpenAIImageGeneration:
+		return t.transformGenerationRequest(httpReq)
+	case llm.APIFormatOpenAIImageEdit:
+		return t.transformEditRequest(httpReq)
+	case llm.APIFormatOpenAIImageVariation:
+		return t.transformVariationRequest(httpReq)
+	default:
+		return nil, fmt.Errorf("%w: unknown image api format: %s", transformer.ErrInvalidRequest, t.apiFormat)
+	}
+}
+
+func (t *ImageInboundTransformer) TransformResponse(ctx context.Context, llmResp *llm.Response) (*httpclient.Response, error) {
+	if llmResp == nil || llmResp.Image == nil {
+		return nil, fmt.Errorf("%w: image response is nil", transformer.ErrInvalidResponse)
+	}
+
+	created := llmResp.Created
+	if created == 0 {
+		created = time.Now().Unix()
+	}
+
+	oaiResp := ImagesResponse{
+		Created: created,
+		Data:    make([]ImageData, 0),
+	}
+
+	img := llmResp.Image
+	oaiResp.Created = img.Created
+	oaiResp.Background = img.Background
+	oaiResp.OutputFormat = img.OutputFormat
+	oaiResp.Quality = img.Quality
+	oaiResp.Size = img.Size
+
+	if llmResp.Usage != nil {
+		oaiResp.Usage = &ImagesResponseUsage{
+			InputTokens:  llmResp.Usage.PromptTokens,
+			OutputTokens: llmResp.Usage.CompletionTokens,
+			TotalTokens:  llmResp.Usage.TotalTokens,
+			Cost:         llmResp.Usage.Cost,
+		}
+		if llmResp.Usage.PromptTokensDetails != nil {
+			oaiResp.Usage.InputTokensDetails = &ImagesResponseUsageInputTokensDetails{
+				ImageTokens:  llmResp.Usage.PromptTokensDetails.ImageTokens,
+				TextTokens:   llmResp.Usage.PromptTokensDetails.TextTokens,
+				CachedTokens: llmResp.Usage.PromptTokensDetails.CachedTokens,
+			}
+		}
+
+		if llmResp.Usage.CompletionTokensDetails != nil {
+			oaiResp.Usage.OutputTokensDetails = &ImagesResponseUsageOutputTokensDetails{
+				ReasoningTokens: llmResp.Usage.CompletionTokensDetails.ReasoningTokens,
+			}
+		}
+	}
+
+	for _, data := range img.Data {
+		oaiResp.Data = append(oaiResp.Data, ImageData{
+			B64JSON:       data.B64JSON,
+			URL:           data.URL,
+			RevisedPrompt: data.RevisedPrompt,
+		})
+	}
+
+	body, err := json.Marshal(oaiResp)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal image response: %w", err)
+	}
+
+	return &httpclient.Response{
+		StatusCode: http.StatusOK,
+		Body:       body,
+		Headers: http.Header{
+			"Content-Type":  []string{"application/json"},
+			"Cache-Control": []string{"no-cache"},
+		},
+	}, nil
+}
+
+func (t *ImageInboundTransformer) TransformStream(ctx context.Context, stream streams.Stream[*llm.Response]) (streams.Stream[*httpclient.StreamEvent], error) {
+	return nil, fmt.Errorf("%w: image request does not support streaming", transformer.ErrInvalidRequest)
+}
+
+func (t *ImageInboundTransformer) TransformError(ctx context.Context, rawErr error) *httpclient.Error {
+	chatInbound := NewInboundTransformer()
+	return chatInbound.TransformError(ctx, rawErr)
+}
+
+func (t *ImageInboundTransformer) AggregateStreamChunks(ctx context.Context, chunks []*httpclient.StreamEvent) ([]byte, llm.ResponseMeta, error) {
+	return nil, llm.ResponseMeta{}, fmt.Errorf("%w: image request does not support streaming", transformer.ErrInvalidRequest)
+}
+
+func (t *ImageInboundTransformer) transformGenerationRequest(httpReq *httpclient.Request) (*llm.Request, error) {
+	contentType := strings.ToLower(httpReq.Headers.Get("Content-Type"))
+	if !strings.Contains(contentType, "application/json") {
+		return nil, fmt.Errorf("%w: generations requires application/json", transformer.ErrInvalidRequest)
+	}
+
+	var genReq ImageGenerationRequest
+
+	if err := json.Unmarshal(httpReq.Body, &genReq); err != nil {
+		return nil, fmt.Errorf("%w: failed to decode generation request: %w", transformer.ErrInvalidRequest, err)
+	}
+
+	if genReq.Stream {
+		return nil, fmt.Errorf("%w: image generation does not support streaming", transformer.ErrInvalidRequest)
+	}
+
+	model := genReq.Model
+	if model == "" {
+		model = "dall-e-2"
+	}
+
+	if genReq.Prompt == "" {
+		return nil, fmt.Errorf("%w: prompt is required", transformer.ErrInvalidRequest)
+	}
+
+	images, err := parseGenerationImageField(genReq.Image)
+	if err != nil {
+		return nil, err
+	}
+
+	imageReq := &llm.ImageRequest{
+		Prompt:            genReq.Prompt,
+		Images:            images,
+		N:                 genReq.N,
+		Size:              genReq.Size,
+		Quality:           genReq.Quality,
+		ResponseFormat:    genReq.ResponseFormat,
+		User:              genReq.User,
+		Background:        genReq.Background,
+		OutputFormat:      genReq.OutputFormat,
+		OutputCompression: genReq.OutputCompression,
+		Moderation:        genReq.Moderation,
+		PartialImages:     genReq.PartialImages,
+		Style:             genReq.Style,
+	}
+
+	llmReq := &llm.Request{
+		Model:       model,
+		Modalities:  []string{"image"},
+		Stream:      lo.ToPtr(false),
+		RawRequest:  httpReq,
+		RequestType: llm.RequestTypeImage,
+		APIFormat:   t.apiFormat,
+		Image:       imageReq,
+	}
+
+	return llmReq, nil
+}
+
+func (t *ImageInboundTransformer) transformEditRequest(httpReq *httpclient.Request) (*llm.Request, error) {
+	// Some providers (e.g. sensenova) accept image edits as application/json with
+	// base64 data URLs instead of multipart/form-data.
+	mediaType, _, err := mime.ParseMediaType(httpReq.Headers.Get("Content-Type"))
+	if err != nil {
+		return nil, fmt.Errorf("%w: invalid content-type", transformer.ErrInvalidRequest)
+	}
+	if strings.EqualFold(mediaType, "application/json") {
+		return t.transformEditJSONRequest(httpReq)
+	}
+
+	formData, err := parseMultipartRequest(httpReq)
+	if err != nil {
+		return nil, err
+	}
+
+	if strings.EqualFold(strings.TrimSpace(formData.Fields["stream"]), "true") {
+		return nil, fmt.Errorf("%w: image edit does not support streaming", transformer.ErrInvalidRequest)
+	}
+
+	prompt := strings.TrimSpace(formData.Fields["prompt"])
+	if prompt == "" {
+		return nil, fmt.Errorf("%w: prompt is required for image edits", transformer.ErrInvalidRequest)
+	}
+
+	model := strings.TrimSpace(formData.Fields["model"])
+	if model == "" {
+		model = "dall-e-2"
+	}
+
+	if len(formData.Images) == 0 {
+		return nil, fmt.Errorf("%w: at least one image is required for edits", transformer.ErrInvalidRequest)
+	}
+
+	// Build JSONBody for logging: replace binary image data with metadata descriptions.
+	if jsonBody, err := buildMultipartJSONBody(formData.Fields, formData.Images, formData.Mask); err == nil {
+		httpReq.JSONBody = jsonBody
+	}
+
+	// Extract image data for ImageRequest
+	images := make([][]byte, 0, len(formData.Images))
+	for _, img := range formData.Images {
+		images = append(images, img.Data)
+	}
+
+	var mask []byte
+	if formData.Mask != nil {
+		mask = formData.Mask.Data
+	}
+
+	user := strings.TrimSpace(formData.Fields["user"])
+
+	imageReq := &llm.ImageRequest{
+		Prompt:            prompt,
+		Images:            images,
+		Mask:              mask,
+		N:                 parseOptionalInt64(formData.Fields["n"]),
+		Size:              strings.TrimSpace(formData.Fields["size"]),
+		Quality:           strings.TrimSpace(formData.Fields["quality"]),
+		ResponseFormat:    strings.TrimSpace(formData.Fields["response_format"]),
+		User:              user,
+		Background:        strings.TrimSpace(formData.Fields["background"]),
+		OutputFormat:      strings.TrimSpace(formData.Fields["output_format"]),
+		OutputCompression: parseOptionalInt64(formData.Fields["output_compression"]),
+		InputFidelity:     strings.TrimSpace(formData.Fields["input_fidelity"]),
+		PartialImages:     parseOptionalInt64(formData.Fields["partial_images"]),
+	}
+
+	llmReq := &llm.Request{
+		Model:       model,
+		Modalities:  []string{"image"},
+		Stream:      lo.ToPtr(false),
+		RawRequest:  httpReq,
+		RequestType: llm.RequestTypeImage,
+		APIFormat:   t.apiFormat,
+		Image:       imageReq,
+	}
+
+	return llmReq, nil
+}
+
+// ImageEditJSONRequest represents an application/json body for the image edit API.
+// The Image field accepts a single data URL string or an array of data URL strings;
+// Mask accepts a data URL string.
+type ImageEditJSONRequest struct {
+	Prompt            string          `json:"prompt"`
+	Model             string          `json:"model"`
+	Image             json.RawMessage `json:"image,omitempty"`
+	Mask              string          `json:"mask,omitempty"`
+	N                 *int64          `json:"n,omitempty"`
+	Size              string          `json:"size,omitempty"`
+	Quality           string          `json:"quality,omitempty"`
+	ResponseFormat    string          `json:"response_format,omitempty"`
+	User              string          `json:"user,omitempty"`
+	Background        string          `json:"background,omitempty"`
+	OutputFormat      string          `json:"output_format,omitempty"`
+	OutputCompression *int64          `json:"output_compression,omitempty"`
+	InputFidelity     string          `json:"input_fidelity,omitempty"`
+	PartialImages     *int64          `json:"partial_images,omitempty"`
+	Stream            bool            `json:"stream,omitempty"`
+}
+
+func (t *ImageInboundTransformer) transformEditJSONRequest(httpReq *httpclient.Request) (*llm.Request, error) {
+	// Mirror the multipart path's guard: ReadHTTPRequest reads the body without a
+	// limit, and base64 payloads amplify memory further once decoded.
+	if len(httpReq.Body) > maxImageBodySize {
+		return nil, fmt.Errorf("%w: request body too large", transformer.ErrInvalidRequest)
+	}
+
+	var editReq ImageEditJSONRequest
+
+	if err := json.Unmarshal(httpReq.Body, &editReq); err != nil {
+		return nil, fmt.Errorf("%w: failed to decode image edit request: %w", transformer.ErrInvalidRequest, err)
+	}
+
+	if editReq.Stream {
+		return nil, fmt.Errorf("%w: image edit does not support streaming", transformer.ErrInvalidRequest)
+	}
+
+	prompt := strings.TrimSpace(editReq.Prompt)
+	if prompt == "" {
+		return nil, fmt.Errorf("%w: prompt is required for image edits", transformer.ErrInvalidRequest)
+	}
+
+	model := strings.TrimSpace(editReq.Model)
+	if model == "" {
+		model = "dall-e-2"
+	}
+
+	images, err := parseGenerationImageField(editReq.Image)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(images) == 0 {
+		return nil, fmt.Errorf("%w: at least one image is required for edits", transformer.ErrInvalidRequest)
+	}
+
+	if len(images) > maxImageCount {
+		return nil, fmt.Errorf("%w: too many images", transformer.ErrInvalidRequest)
+	}
+
+	var mask []byte
+
+	if maskDataURL := strings.TrimSpace(editReq.Mask); maskDataURL != "" {
+		mask, err = decodeDataURLToBytes(maskDataURL)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	imageReq := &llm.ImageRequest{
+		Prompt:            prompt,
+		Images:            images,
+		Mask:              mask,
+		N:                 editReq.N,
+		Size:              strings.TrimSpace(editReq.Size),
+		Quality:           strings.TrimSpace(editReq.Quality),
+		ResponseFormat:    strings.TrimSpace(editReq.ResponseFormat),
+		User:              strings.TrimSpace(editReq.User),
+		Background:        strings.TrimSpace(editReq.Background),
+		OutputFormat:      strings.TrimSpace(editReq.OutputFormat),
+		OutputCompression: editReq.OutputCompression,
+		InputFidelity:     strings.TrimSpace(editReq.InputFidelity),
+		PartialImages:     editReq.PartialImages,
+	}
+
+	llmReq := &llm.Request{
+		Model:       model,
+		Modalities:  []string{"image"},
+		Stream:      lo.ToPtr(false),
+		RawRequest:  httpReq,
+		RequestType: llm.RequestTypeImage,
+		APIFormat:   t.apiFormat,
+		Image:       imageReq,
+	}
+
+	return llmReq, nil
+}
+
+func (t *ImageInboundTransformer) transformVariationRequest(httpReq *httpclient.Request) (*llm.Request, error) {
+	formData, err := parseMultipartRequest(httpReq)
+	if err != nil {
+		return nil, err
+	}
+
+	if strings.EqualFold(strings.TrimSpace(formData.Fields["stream"]), "true") {
+		return nil, fmt.Errorf("%w: image variation does not support streaming", transformer.ErrInvalidRequest)
+	}
+
+	if strings.TrimSpace(formData.Fields["prompt"]) != "" {
+		return nil, fmt.Errorf("%w: prompt is not allowed for variations", transformer.ErrInvalidRequest)
+	}
+
+	model := strings.TrimSpace(formData.Fields["model"])
+	if model == "" {
+		model = "dall-e-2"
+	}
+
+	if len(formData.Images) == 0 {
+		return nil, fmt.Errorf("%w: image is required for variations", transformer.ErrInvalidRequest)
+	}
+
+	if len(formData.Images) > 1 {
+		return nil, fmt.Errorf("%w: variations supports a single image", transformer.ErrInvalidRequest)
+	}
+
+	// Build JSONBody for logging: replace binary image data with metadata descriptions.
+	if jsonBody, err := buildMultipartJSONBody(formData.Fields, formData.Images, nil); err == nil {
+		httpReq.JSONBody = jsonBody
+	}
+
+	user := strings.TrimSpace(formData.Fields["user"])
+
+	imageReq := &llm.ImageRequest{
+		Images:         [][]byte{formData.Images[0].Data},
+		N:              parseOptionalInt64(formData.Fields["n"]),
+		Size:           strings.TrimSpace(formData.Fields["size"]),
+		ResponseFormat: strings.TrimSpace(formData.Fields["response_format"]),
+		User:           user,
+	}
+
+	llmReq := &llm.Request{
+		Model:       model,
+		Modalities:  []string{"image"},
+		Stream:      lo.ToPtr(false),
+		RawRequest:  httpReq,
+		RequestType: llm.RequestTypeImage,
+		APIFormat:   t.apiFormat,
+		Image:       imageReq,
+	}
+
+	return llmReq, nil
+}
+
+type multipartFile struct {
+	ContentType string
+	Data        []byte
+}
+
+type imageFormData struct {
+	Images []multipartFile
+	Mask   *multipartFile
+	Fields map[string]string
+}
+
+func parseMultipartRequest(httpReq *httpclient.Request) (*imageFormData, error) {
+	if len(httpReq.Body) > maxImageBodySize {
+		return nil, fmt.Errorf("%w: request body too large", transformer.ErrInvalidRequest)
+	}
+
+	contentType := httpReq.Headers.Get("Content-Type")
+
+	mediaType, params, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		return nil, fmt.Errorf("%w: invalid content-type", transformer.ErrInvalidRequest)
+	}
+
+	if !strings.HasPrefix(strings.ToLower(mediaType), "multipart/") {
+		return nil, fmt.Errorf("%w: expected multipart/form-data", transformer.ErrInvalidRequest)
+	}
+
+	boundary := params["boundary"]
+	if boundary == "" {
+		return nil, fmt.Errorf("%w: missing boundary in content-type", transformer.ErrInvalidRequest)
+	}
+
+	reader := multipart.NewReader(bytes.NewReader(httpReq.Body), boundary)
+
+	formData := &imageFormData{
+		Fields: map[string]string{},
+	}
+
+	imageCount := 0
+
+	for {
+		part, err := reader.NextPart()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+
+		if err != nil {
+			return nil, fmt.Errorf("%w: failed to read multipart", transformer.ErrInvalidRequest)
+		}
+
+		fieldName := part.FormName()
+		filename := part.FileName()
+
+		if filename == "" {
+			value, err := io.ReadAll(io.LimitReader(part, int64(maxImageFileSize)+1))
+			if err != nil {
+				return nil, fmt.Errorf("%w: failed to read multipart field", transformer.ErrInvalidRequest)
+			}
+
+			if len(value) > maxImageFileSize {
+				return nil, fmt.Errorf("%w: multipart field too large", transformer.ErrInvalidRequest)
+			}
+
+			formData.Fields[fieldName] = string(value)
+
+			continue
+		}
+
+		imageCount++
+		if imageCount > maxImageCount {
+			return nil, fmt.Errorf("%w: too many images", transformer.ErrInvalidRequest)
+		}
+
+		contentType := strings.TrimSpace(part.Header.Get("Content-Type"))
+
+		data, err := io.ReadAll(io.LimitReader(part, int64(maxImageFileSize)+1))
+		if err != nil {
+			return nil, fmt.Errorf("%w: failed to read multipart file", transformer.ErrInvalidRequest)
+		}
+
+		if len(data) > maxImageFileSize {
+			return nil, fmt.Errorf("%w: file too large", transformer.ErrInvalidRequest)
+		}
+
+		if contentType == "" {
+			contentType = http.DetectContentType(lo.Ternary(len(data) > 512, data[:512], data))
+		}
+
+		if !isAllowedImageType(contentType) {
+			return nil, fmt.Errorf("%w: unsupported image type", transformer.ErrInvalidRequest)
+		}
+
+		file := multipartFile{
+			ContentType: contentType,
+			Data:        data,
+		}
+
+		switch fieldName {
+		case "image", "image[]":
+			formData.Images = append(formData.Images, file)
+		case "mask":
+			formData.Mask = &file
+		default:
+		}
+	}
+
+	return formData, nil
+}
+
+// buildMultipartJSONBody builds a JSON representation of a multipart/form-data request
+// suitable for logging. Binary image/mask data is encoded as base64 data URLs
+// so they can be displayed in the trace UI.
+func buildMultipartJSONBody(fields map[string]string, images []multipartFile, mask *multipartFile) ([]byte, error) {
+	body := make(map[string]any, len(fields)+2)
+
+	for k, v := range fields {
+		if v != "" {
+			body[k] = v
+		}
+	}
+
+	switch len(images) {
+	case 1:
+		body["image"] = multipartFileToDataURL(images[0])
+	case 0:
+		// no image
+	default:
+		urls := make([]string, len(images))
+		for i, img := range images {
+			urls[i] = multipartFileToDataURL(img)
+		}
+
+		body["image"] = urls
+	}
+
+	if mask != nil {
+		body["mask"] = multipartFileToDataURL(*mask)
+	}
+
+	return json.Marshal(body)
+}
+
+func multipartFileToDataURL(f multipartFile) string {
+	// Use xurl.BuildDataURL (single exact-size concat) instead of fmt.Sprintf to
+	// avoid the printer's doubling-growth buffer churn on large base64 data.
+	return xurl.BuildDataURL(f.ContentType, base64.StdEncoding.EncodeToString(f.Data), true)
+}
+
+func isAllowedImageType(contentType string) bool {
+	for _, allowed := range allowedImageTypes {
+		if strings.EqualFold(contentType, allowed) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func parseOptionalInt64(s string) *int64 {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil
+	}
+
+	v, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return nil
+	}
+
+	return &v
+}
+
+// parseGenerationImageField parses the "image" field from a JSON image generation
+// request body. The field can be a single data URL string or an array of data URL
+// strings. The returned [][]byte contains the decoded raw image bytes.
+func parseGenerationImageField(raw json.RawMessage) ([][]byte, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+
+	var single string
+	if err := json.Unmarshal(raw, &single); err == nil {
+		data, err := decodeDataURLToBytes(single)
+		if err != nil {
+			return nil, err
+		}
+
+		return [][]byte{data}, nil
+	}
+
+	var many []string
+	if err := json.Unmarshal(raw, &many); err != nil {
+		return nil, fmt.Errorf("%w: image field must be a string or array of strings", transformer.ErrInvalidRequest)
+	}
+	if len(many) > maxImageCount {
+		return nil, fmt.Errorf("%w: too many images", transformer.ErrInvalidRequest)
+	}
+
+	images := make([][]byte, 0, len(many))
+	for _, url := range many {
+		data, err := decodeDataURLToBytes(url)
+		if err != nil {
+			return nil, err
+		}
+
+		images = append(images, data)
+	}
+
+	return images, nil
+}
+
+// decodeDataURLToBytes decodes a data URL (data:image/png;base64,...) to raw bytes.
+func decodeDataURLToBytes(dataURL string) ([]byte, error) {
+	if !xurl.IsDataURL(dataURL) {
+		return nil, fmt.Errorf("%w: image must be a data URL", transformer.ErrInvalidRequest)
+	}
+
+	parsed := xurl.ParseDataURL(dataURL)
+	if parsed == nil {
+		return nil, fmt.Errorf("%w: invalid data URL format", transformer.ErrInvalidRequest)
+	}
+
+	if !parsed.IsBase64 {
+		return nil, fmt.Errorf("%w: image data URL must be base64-encoded", transformer.ErrInvalidRequest)
+	}
+	if !isAllowedImageType(parsed.MediaType) {
+		return nil, fmt.Errorf("%w: unsupported image content type %q", transformer.ErrInvalidRequest, parsed.MediaType)
+	}
+	if len(parsed.Data) > base64.StdEncoding.EncodedLen(maxImageFileSize) {
+		return nil, fmt.Errorf("%w: image file too large", transformer.ErrInvalidRequest)
+	}
+
+	data, err := base64.StdEncoding.DecodeString(parsed.Data)
+	if err != nil {
+		return nil, fmt.Errorf("%w: failed to decode base64 image data", transformer.ErrInvalidRequest)
+	}
+	if len(data) > maxImageFileSize {
+		return nil, fmt.Errorf("%w: image file too large", transformer.ErrInvalidRequest)
+	}
+
+	return data, nil
+}
