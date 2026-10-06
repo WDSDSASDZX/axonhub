@@ -1,0 +1,342 @@
+package conf
+
+import (
+	"context"
+	"encoding"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"time"
+
+	"github.com/go-viper/mapstructure/v2"
+	"github.com/spf13/viper"
+	"go.uber.org/fx"
+	"go.uber.org/zap/zapcore"
+
+	"github.com/looplj/axonhub/internal/log"
+	"github.com/looplj/axonhub/internal/metrics"
+	"github.com/looplj/axonhub/internal/pkg/xcache"
+	"github.com/looplj/axonhub/internal/server"
+	"github.com/looplj/axonhub/internal/server/biz"
+	"github.com/looplj/axonhub/internal/server/db"
+	"github.com/looplj/axonhub/internal/server/gc"
+)
+
+type Config struct {
+	fx.Out `yaml:"-" json:"-"`
+
+	DB               db.Config           `conf:"db" yaml:"db" json:"db"`
+	Log              log.Config          `conf:"log" yaml:"log" json:"log"`
+	APIServer        server.Config       `conf:"server" yaml:"server" json:"server"`
+	Metrics          metrics.Config      `conf:"metrics" yaml:"metrics" json:"metrics"`
+	GC               gc.Config           `conf:"gc" yaml:"gc" json:"gc"`
+	Cache            xcache.Config       `conf:"cache" yaml:"cache" json:"cache"`
+	ProviderQuota    providerQuotaConfig `conf:"provider_quota" yaml:"provider_quota" json:"provider_quota"`
+	OIDC             biz.OIDCConfig      `conf:"oidc" yaml:"oidc" json:"oidc"`
+	DisableSSLVerify bool                `name:"disable_ssl_verify" yaml:"-" json:"-"`
+	AllowNoAuth      bool                `name:"allow_no_auth" yaml:"-" json:"-"`
+	APIKeyPrefix     string              `name:"api_key_prefix" yaml:"-" json:"-"`
+}
+
+type providerQuotaConfig struct {
+	CheckInterval             time.Duration `conf:"check_interval" yaml:"check_interval" json:"check_interval"`
+	WarningCheckIntervalRatio int           `conf:"warning_check_interval_ratio" yaml:"warning_check_interval_ratio" json:"warning_check_interval_ratio"`
+}
+
+// Loader remembers the config file selected during startup. Each load creates
+// a fresh Viper instance so transient overrides never leak across reloads.
+type Loader struct {
+	configFile string
+}
+
+// NewLoader reads the initial configuration and records the selected config
+// file for subsequent runtime reloads.
+func NewLoader() (Config, *Loader, error) {
+	cfg, configFile, err := loadConfig("")
+	if err != nil {
+		return Config{}, nil, err
+	}
+
+	if cfg.Cache.Redis.Addr != "" {
+		log.Warn(context.Background(), "Config `cache.redis.addr` Deprecated: Use `cache.redis.addrs` instead.")
+	}
+
+	log.Debug(context.Background(), "Config loaded successfully", log.Any("config", cfg))
+
+	return cfg, &Loader{configFile: configFile}, nil
+}
+
+// ConfigFile returns the absolute path of the config file selected at startup.
+// It returns an empty string when the process is using defaults and
+// environment variables only.
+func (l *Loader) ConfigFile() string {
+	return l.configFile
+}
+
+// Reload re-reads the startup-selected config file using a new Viper instance.
+func (l *Loader) Reload() (Config, error) {
+	if l.configFile == "" {
+		return Config{}, errors.New("config reload is unavailable without a config file")
+	}
+
+	cfg, _, err := loadConfig(l.configFile)
+	return cfg, err
+}
+
+func loadConfig(configFile string) (Config, string, error) {
+	v := viper.New()
+	setDefaults(v)
+
+	v.AutomaticEnv()
+	v.SetEnvPrefix("AXONHUB")
+	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+
+	if configFile != "" {
+		v.SetConfigFile(configFile)
+	} else {
+		v.SetConfigName("config")
+		v.SetConfigType("yml")
+		v.AddConfigPath(".")
+		v.AddConfigPath("/etc/axonhub/")
+		v.AddConfigPath("$HOME/.config/axonhub/")
+		v.AddConfigPath("./conf")
+	}
+
+	if err := v.ReadInConfig(); err != nil {
+		var configFileNotFoundError viper.ConfigFileNotFoundError
+		if configFile != "" || !errors.As(err, &configFileNotFoundError) {
+			return Config{}, "", fmt.Errorf("failed to read config file: %w", err)
+		}
+		// Config file not found, use defaults and environment variables
+	}
+
+	cfg, err := unmarshal(v)
+	if err != nil {
+		return Config{}, "", err
+	}
+
+	configFile = v.ConfigFileUsed()
+	if configFile != "" {
+		configFile, err = filepath.Abs(configFile)
+		if err != nil {
+			return Config{}, "", fmt.Errorf("resolve config file path: %w", err)
+		}
+	}
+
+	return cfg, configFile, nil
+}
+
+// unmarshal parses a full Config from the given Viper instance using the
+// customized decode hook and "conf" tag.
+func unmarshal(v *viper.Viper) (Config, error) {
+	// Parse log level from string before unmarshaling
+	logLevelStr := v.GetString("log.level")
+
+	logLevel, err := parseLogLevel(logLevelStr)
+	if err != nil {
+		return Config{}, fmt.Errorf("invalid log level '%s': %w", logLevelStr, err)
+	}
+	// Set the parsed log level back to viper for unmarshaling
+	v.Set("log.level", int(logLevel))
+
+	var config Config
+	if err := v.Unmarshal(&config, func(dc *mapstructure.DecoderConfig) {
+		dc.DecodeHook = customizedDecodeHook
+		dc.TagName = "conf"
+	}); err != nil {
+		return Config{}, fmt.Errorf("failed to unmarshal config: %w", err)
+	}
+
+	config.DisableSSLVerify = config.APIServer.DisableSSLVerify
+	config.AllowNoAuth = config.APIServer.API.Auth.AllowNoAuth
+	config.APIKeyPrefix = config.APIServer.API.Auth.KeyPrefix
+
+	return config, nil
+}
+
+// Load loads configuration from YAML file and environment variables.
+// This is a convenience function for CLI subcommands that only need a
+// one-shot config load without the Loader. The fx application uses NewLoader
+// instead so it can reload config at runtime.
+func Load() (Config, error) {
+	cfg, _, err := NewLoader()
+	return cfg, err
+}
+
+var (
+	_TypeTextUnmarshaler = reflect.TypeFor[encoding.TextUnmarshaler]()
+	_TypeDuration        = reflect.TypeFor[time.Duration]()
+)
+
+func customizedDecodeHook(srcType reflect.Type, dstType reflect.Type, data any) (any, error) {
+	str, ok := data.(string)
+	if !ok {
+		return data, nil
+	}
+
+	switch {
+	case reflect.PointerTo(dstType).Implements(_TypeTextUnmarshaler):
+		value := reflect.New(dstType)
+
+		u, _ := value.Interface().(encoding.TextUnmarshaler)
+		if err := u.UnmarshalText([]byte(str)); err != nil {
+			return nil, err
+		}
+
+		return u, nil
+	case dstType == _TypeDuration:
+		if strings.TrimSpace(str) == "" {
+			return time.Duration(0), nil
+		}
+		return time.ParseDuration(str)
+
+	case dstType.Kind() == reflect.Slice || dstType.Kind() == reflect.Map || dstType.Kind() == reflect.Struct:
+		// Attempt to parse as JSON for environment variable support
+		text := strings.TrimSpace(str)
+		if strings.HasPrefix(text, "[") || strings.HasPrefix(text, "{") {
+			var decoded any
+			if err := json.Unmarshal([]byte(text), &decoded); err == nil {
+				return decoded, nil
+			}
+		}
+
+		return data, nil
+
+	default:
+		return data, nil
+	}
+}
+
+// setDefaults sets default configuration values.
+func setDefaults(v *viper.Viper) {
+	// Server defaults
+	v.SetDefault("server.host", "0.0.0.0")
+	v.SetDefault("server.port", 8090)
+	v.SetDefault("server.pid_file", "")
+	v.SetDefault("server.public_url", "")
+	v.SetDefault("server.name", "AxonHub")
+	v.SetDefault("server.base_path", "")
+	v.SetDefault("server.request_timeout", "30s")
+	v.SetDefault("server.llm_request_timeout", "600s")
+	v.SetDefault("server.sse_keep_alive.enabled", false)
+	v.SetDefault("server.sse_keep_alive.interval", "15s")
+	v.SetDefault("server.trace.thread_header", "AH-Thread-Id")
+	v.SetDefault("server.trace.trace_header", "AH-Trace-Id")
+	v.SetDefault("server.trace.extra_trace_headers", []string{})
+	v.SetDefault("server.trace.response_trace_headers", []string{})
+	v.SetDefault("server.trace.extra_trace_body_fields", []string{})
+	v.SetDefault("server.trace.claude_code_trace_enabled", true)
+	v.SetDefault("server.trace.codex_trace_enabled", true)
+	v.SetDefault("server.trace.opencode_trace_enabled", true)
+
+	// Dashboard defaults
+	v.SetDefault("server.dashboard.all_time_token_stats_soft_ttl", "1h")
+	v.SetDefault("server.dashboard.all_time_token_stats_hard_ttl", "24h")
+
+	v.SetDefault("server.debug", false)
+	v.SetDefault("server.disable_ssl_verify", false)
+
+	// Max multipart memory for file uploads (backup restore, etc.)
+	// Default: 32M (matching Gin's default). Supports K/M/G suffixes, e.g. "512M", "1G".
+	v.SetDefault("server.max_multipart_memory", "32M")
+
+	// CORS defaults
+	v.SetDefault("server.cors.enabled", false)
+	v.SetDefault("server.cors.debug", false)
+	v.SetDefault("server.cors.allowed_origins", []string{"http://localhost:8090"})
+	v.SetDefault("server.cors.allowed_methods", []string{"GET", "POST", "DELETE", "PATCH", "PUT", "OPTIONS", "HEAD"})
+	v.SetDefault("server.cors.allowed_headers", []string{"Content-Type", "Authorization", "X-API-Key", "X-Goog-Api-Key", "X-Project-ID", "X-Thread-ID", "X-Trace-ID"})
+	v.SetDefault("server.cors.exposed_headers", []string{})
+	v.SetDefault("server.cors.allow_credentials", false)
+	v.SetDefault("server.cors.max_age", "30m")
+	v.SetDefault("server.api.auth.allow_no_auth", false)
+	v.SetDefault("server.api.auth.key_prefix", "ah")
+
+	// Database defaults
+	v.SetDefault("db.dialect", "sqlite3")
+	v.SetDefault("db.dsn", "file:axonhub.db?cache=shared&_fk=1&_pragma=journal_mode(WAL)")
+	v.SetDefault("db.disable_auto_migration", false)
+	v.SetDefault("db.disable_sqlite_auto_wal", false)
+	v.SetDefault("db.debug", false)
+	v.SetDefault("db.max_open_conns", 20)
+	v.SetDefault("db.max_idle_conns", 10)
+	v.SetDefault("db.conn_max_lifetime", "30m")
+	v.SetDefault("db.conn_max_idle_time", "10m")
+	v.SetDefault("db.read_replica.read_dsn", "")
+	v.SetDefault("db.read_replica.read_max_open_conns", 0)
+	v.SetDefault("db.read_replica.read_max_idle_conns", 0)
+
+	// Log defaults
+	v.SetDefault("log.name", "axonhub")
+	v.SetDefault("log.debug", false)
+	v.SetDefault("log.skip_level", 1)
+	v.SetDefault("log.level", "info")
+	v.SetDefault("log.level_key", "level")
+	v.SetDefault("log.time_key", "time")
+	v.SetDefault("log.caller_key", "label")
+	v.SetDefault("log.function_key", "")
+	v.SetDefault("log.name_key", "logger")
+	v.SetDefault("log.encoding", "json")
+	v.SetDefault("log.includes", []string{})
+	v.SetDefault("log.excludes", []string{})
+	v.SetDefault("log.output", "stdio")
+	v.SetDefault("log.file.path", "logs/axonhub.log")
+	v.SetDefault("log.file.max_size", 100)   // MB
+	v.SetDefault("log.file.max_age", 30)     // days
+	v.SetDefault("log.file.max_backups", 10) // files
+	v.SetDefault("log.file.local_time", true)
+
+	// Metrics defaults
+	v.SetDefault("metrics.enabled", false)
+
+	// GC defaults
+	v.SetDefault("gc.cron", "0 2 * * *") // Daily at 2:00 AM
+	v.SetDefault("gc.vacuum_enabled", true)
+	v.SetDefault("gc.vacuum_full", false)
+
+	// Provider quota defaults
+	v.SetDefault("provider_quota.check_interval", "5m")
+	v.SetDefault("provider_quota.warning_check_interval_ratio", 4) // Warning interval = check_interval * ratio
+
+	// Cache defaults
+	v.SetDefault("cache.mode", "memory")
+	v.SetDefault("cache.default_expiration", "5m")
+	v.SetDefault("cache.cleanup_interval", "10m")
+	v.SetDefault("cache.redis.addr", "")
+	v.SetDefault("cache.redis.addrs", []string{})
+	v.SetDefault("cache.redis.url", "")
+	v.SetDefault("cache.redis.username", "")
+	v.SetDefault("cache.redis.password", "")
+	v.SetDefault("cache.redis.master_name", "")
+	v.SetDefault("cache.redis.sentinel_username", "")
+	v.SetDefault("cache.redis.sentinel_password", "")
+	// Note: cache.redis.db has no default value to allow explicit override to 0
+	v.SetDefault("cache.redis.tls", false)
+	v.SetDefault("cache.redis.tls_insecure_skip_verify", false)
+
+	// OIDC defaults
+	v.SetDefault("oidc.providers", []biz.OIDCProvider{})
+}
+
+// parseLogLevel converts a string log level to zapcore.Level.
+func parseLogLevel(level string) (zapcore.Level, error) {
+	switch strings.ToLower(level) {
+	case "debug":
+		return zapcore.DebugLevel, nil
+	case "info":
+		return zapcore.InfoLevel, nil
+	case "warn", "warning":
+		return zapcore.WarnLevel, nil
+	case "error":
+		return zapcore.ErrorLevel, nil
+	case "panic":
+		return zapcore.PanicLevel, nil
+	case "fatal":
+		return zapcore.FatalLevel, nil
+	default:
+		return zapcore.InfoLevel, fmt.Errorf("unknown log level: %s", level)
+	}
+}
