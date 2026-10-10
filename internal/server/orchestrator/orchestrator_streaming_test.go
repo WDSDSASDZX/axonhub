@@ -1,0 +1,997 @@
+package orchestrator
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/looplj/axonhub/internal/authz"
+	"github.com/looplj/axonhub/internal/contexts"
+	"github.com/looplj/axonhub/internal/ent"
+	"github.com/looplj/axonhub/internal/ent/channel"
+	"github.com/looplj/axonhub/internal/ent/enttest"
+	"github.com/looplj/axonhub/internal/ent/request"
+	"github.com/looplj/axonhub/internal/ent/requestexecution"
+	"github.com/looplj/axonhub/internal/objects"
+	"github.com/looplj/axonhub/internal/server/biz"
+	"github.com/looplj/axonhub/llm/httpclient"
+	"github.com/looplj/axonhub/llm/pipeline"
+	"github.com/looplj/axonhub/llm/pipeline/stream"
+	"github.com/looplj/axonhub/llm/streams"
+	anthropictransformer "github.com/looplj/axonhub/llm/transformer/anthropic"
+	geminitransformer "github.com/looplj/axonhub/llm/transformer/gemini"
+	"github.com/looplj/axonhub/llm/transformer/openai"
+)
+
+func mustMarshalGeminiStreamChunk(resp *geminitransformer.GenerateContentResponse) []byte {
+	data, err := json.Marshal(resp)
+	if err != nil {
+		panic(err)
+	}
+
+	return data
+}
+
+func TestChatCompletionOrchestrator_Process_Streaming_PreservesGeminiGroundingAnnotations(t *testing.T) {
+	ctx := context.Background()
+	ctx = authz.WithTestBypass(ctx)
+
+	client := enttest.NewEntClient(t, "sqlite3", "file:ent?mode=memory&_fk=0")
+	defer client.Close()
+
+	ctx = ent.NewContext(ctx, client)
+
+	project := createTestProject(t, ctx, client)
+	channelRow, err := client.Channel.Create().
+		SetType(channel.TypeGemini).
+		SetName("Test Gemini Channel").
+		SetBaseURL("https://generativelanguage.googleapis.com").
+		SetCredentials(objects.ChannelCredentials{APIKey: "test-api-key"}).
+		SetSupportedModels([]string{"gpt-4"}).
+		SetDefaultTestModel("gpt-4").
+		Save(ctx)
+	require.NoError(t, err)
+
+	channelService, requestService, systemService, usageLogService := setupTestServices(t, client)
+	require.NoError(t, systemService.SetStoragePolicy(ctx, &biz.StoragePolicy{
+		StoreChunks:       true,
+		LivePreview:       false,
+		StoreRequestBody:  true,
+		StoreResponseBody: true,
+	}))
+
+	streamEvents := []*httpclient.StreamEvent{
+		{Data: mustMarshalGeminiStreamChunk(&geminitransformer.GenerateContentResponse{
+			ResponseID:   "resp_gemini_stream_grounding",
+			ModelVersion: "gemini-2.5-flash",
+			Candidates: []*geminitransformer.Candidate{{
+				Index: 0,
+				Content: &geminitransformer.Content{
+					Role:  "model",
+					Parts: []*geminitransformer.Part{{Text: "Grounded "}},
+				},
+			}},
+		})},
+		{Data: mustMarshalGeminiStreamChunk(&geminitransformer.GenerateContentResponse{
+			ResponseID:   "resp_gemini_stream_grounding",
+			ModelVersion: "gemini-2.5-flash",
+			Candidates: []*geminitransformer.Candidate{{
+				Index: 0,
+				Content: &geminitransformer.Content{
+					Role:  "model",
+					Parts: []*geminitransformer.Part{{Text: "answer"}},
+				},
+				FinishReason: "STOP",
+				GroundingMetadata: &geminitransformer.GroundingMetadata{
+					WebSearchQueries: []string{"grounded query"},
+					GroundingChunks: []*geminitransformer.GroundingChunk{{
+						Web: &geminitransformer.GroundingChunkWeb{
+							URI:   "https://example.com/gemini-stream",
+							Title: "Gemini Stream Source",
+						},
+					}},
+					GroundingSupports: []*geminitransformer.GroundingSupport{{
+						Segment: &geminitransformer.Segment{
+							StartIndex: 0,
+							EndIndex:   8,
+							Text:       "Grounded",
+						},
+						GroundingChunkIndices: []int32{0},
+					}},
+				},
+			}},
+			UsageMetadata: &geminitransformer.UsageMetadata{
+				PromptTokenCount:     10,
+				CandidatesTokenCount: 5,
+				TotalTokenCount:      15,
+			},
+		})},
+	}
+
+	executor := &mockExecutor{streamEvents: streamEvents}
+
+	outbound, err := geminitransformer.NewOutboundTransformer(channelRow.BaseURL, channelRow.Credentials.APIKey)
+	require.NoError(t, err)
+
+	bizChannel := &biz.Channel{Channel: channelRow, Outbound: outbound}
+	channelSelector := &staticChannelSelector{candidates: channelsToTestCandidates([]*biz.Channel{bizChannel}, "gpt-4")}
+
+	orchestrator := &ChatCompletionOrchestrator{
+		channelSelector:       channelSelector,
+		Inbound:               openai.NewInboundTransformer(),
+		RequestService:        requestService,
+		ChannelService:        channelService,
+		PromptProvider:        &stubPromptProvider{},
+		SystemService:         systemService,
+		UsageLogService:       usageLogService,
+		PipelineFactory:       pipeline.NewFactory(executor),
+		ModelMapper:           NewModelMapper(),
+		channelLimiterManager: NewChannelLimiterManager(),
+		Middlewares: []pipeline.Middleware{
+			stream.EnsureUsage(),
+		},
+	}
+
+	httpRequest := buildTestRequest("gpt-4", "Summarize with citations", true)
+	ctx = contexts.WithProjectID(ctx, project.ID)
+
+	result, err := orchestrator.Process(ctx, httpRequest)
+	require.NoError(t, err)
+	assert.Nil(t, result.ChatCompletion)
+	require.NotNil(t, result.ChatCompletionStream)
+
+	var chunks []*httpclient.StreamEvent
+	for result.ChatCompletionStream.Next() {
+		chunks = append(chunks, result.ChatCompletionStream.Current())
+	}
+	require.NoError(t, result.ChatCompletionStream.Err())
+	require.NoError(t, result.ChatCompletionStream.Close())
+	assert.NotEmpty(t, chunks)
+
+	var foundAnnotationChunk bool
+	for _, chunk := range chunks {
+		if string(chunk.Data) == "[DONE]" {
+			continue
+		}
+
+		var streamResp openai.Response
+		err := json.Unmarshal(chunk.Data, &streamResp)
+		require.NoError(t, err)
+		if len(streamResp.Choices) == 0 || streamResp.Choices[0].Delta == nil {
+			continue
+		}
+		if len(streamResp.Choices[0].Delta.Annotations) == 0 {
+			continue
+		}
+
+		annotation := streamResp.Choices[0].Delta.Annotations[0]
+		require.Equal(t, "url_citation", annotation.Type)
+		require.NotNil(t, annotation.URLCitation)
+		require.Equal(t, "https://example.com/gemini-stream", annotation.URLCitation.URL)
+		require.Equal(t, "Gemini Stream Source", annotation.URLCitation.Title)
+		require.NotNil(t, annotation.StartIndex)
+		require.EqualValues(t, 0, *annotation.StartIndex)
+		require.NotNil(t, annotation.EndIndex)
+		require.EqualValues(t, 8, *annotation.EndIndex)
+		foundAnnotationChunk = true
+		break
+	}
+	require.True(t, foundAnnotationChunk, "expected at least one streamed chunk carrying Gemini grounding annotations")
+
+	requests, err := client.Request.Query().All(ctx)
+	require.NoError(t, err)
+	require.Len(t, requests, 1)
+	assert.Equal(t, request.StatusCompleted, requests[0].Status)
+
+	var persistedResp openai.Response
+	err = json.Unmarshal(requests[0].ResponseBody, &persistedResp)
+	require.NoError(t, err)
+	require.Len(t, persistedResp.Choices, 1)
+	require.NotNil(t, persistedResp.Choices[0].Message)
+	require.Equal(t, "Grounded answer", *persistedResp.Choices[0].Message.Content.Content)
+	require.Len(t, persistedResp.Choices[0].Message.Annotations, 1)
+	require.Equal(t, "https://example.com/gemini-stream", persistedResp.Choices[0].Message.Annotations[0].URLCitation.URL)
+	require.Equal(t, "Gemini Stream Source", persistedResp.Choices[0].Message.Annotations[0].URLCitation.Title)
+	require.NotNil(t, persistedResp.Choices[0].Message.Annotations[0].StartIndex)
+	require.EqualValues(t, 0, *persistedResp.Choices[0].Message.Annotations[0].StartIndex)
+	require.NotNil(t, persistedResp.Choices[0].Message.Annotations[0].EndIndex)
+	require.EqualValues(t, 8, *persistedResp.Choices[0].Message.Annotations[0].EndIndex)
+
+	require.NotEmpty(t, requests[0].ResponseChunks)
+	var persistedChunk struct {
+		Event string          `json:"event"`
+		Data  json.RawMessage `json:"data"`
+	}
+	var foundPersistedAnnotationChunk bool
+	for _, rawChunk := range requests[0].ResponseChunks {
+		err := json.Unmarshal(rawChunk, &persistedChunk)
+		require.NoError(t, err)
+
+		var streamResp openai.Response
+		err = json.Unmarshal(persistedChunk.Data, &streamResp)
+		require.NoError(t, err)
+		if len(streamResp.Choices) == 0 || streamResp.Choices[0].Delta == nil {
+			continue
+		}
+		if len(streamResp.Choices[0].Delta.Annotations) == 0 {
+			continue
+		}
+
+		annotation := streamResp.Choices[0].Delta.Annotations[0]
+		require.Equal(t, "https://example.com/gemini-stream", annotation.URLCitation.URL)
+		require.Equal(t, "Gemini Stream Source", annotation.URLCitation.Title)
+		require.NotNil(t, annotation.StartIndex)
+		require.EqualValues(t, 0, *annotation.StartIndex)
+		require.NotNil(t, annotation.EndIndex)
+		require.EqualValues(t, 8, *annotation.EndIndex)
+		foundPersistedAnnotationChunk = true
+		break
+	}
+	require.True(t, foundPersistedAnnotationChunk, "expected persisted response_chunks to preserve Gemini grounding annotations")
+
+	executions, err := client.RequestExecution.Query().All(ctx)
+	require.NoError(t, err)
+	require.Len(t, executions, 1)
+	assert.Equal(t, requestexecution.StatusCompleted, executions[0].Status)
+}
+
+func TestChatCompletionOrchestrator_Process_Streaming_PreservesAnthropicCitations(t *testing.T) {
+	ctx := context.Background()
+	ctx = authz.WithTestBypass(ctx)
+
+	client := enttest.NewEntClient(t, "sqlite3", "file:ent?mode=memory&_fk=0")
+	defer client.Close()
+
+	ctx = ent.NewContext(ctx, client)
+
+	project := createTestProject(t, ctx, client)
+	channelRow, err := client.Channel.Create().
+		SetType(channel.TypeAnthropic).
+		SetName("Test Anthropic Channel").
+		SetBaseURL("https://api.anthropic.com").
+		SetCredentials(objects.ChannelCredentials{APIKey: "test-api-key"}).
+		SetSupportedModels([]string{"gpt-4"}).
+		SetDefaultTestModel("gpt-4").
+		Save(ctx)
+	require.NoError(t, err)
+
+	channelService, requestService, systemService, usageLogService := setupTestServices(t, client)
+	require.NoError(t, systemService.SetStoragePolicy(ctx, &biz.StoragePolicy{
+		StoreChunks:       true,
+		LivePreview:       false,
+		StoreRequestBody:  true,
+		StoreResponseBody: true,
+	}))
+
+	streamEvents := []*httpclient.StreamEvent{
+		{Type: "message_start", Data: []byte(`{"type":"message_start","message":{"id":"msg_stream_citation","type":"message","role":"assistant","content":[],"model":"claude-3-7-sonnet-latest","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":0}}}`)},
+		{Type: "content_block_start", Data: []byte(`{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`)},
+		{Type: "content_block_delta", Data: []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Answer with source"}}`)},
+		{Type: "content_block_delta", Data: []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"citations_delta","citation":{"type":"url_citation","url":"https://example.com/source","title":"Example Source"}}}`)},
+		{Type: "content_block_stop", Data: []byte(`{"type":"content_block_stop","index":0}`)},
+		{Type: "message_delta", Data: []byte(`{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":10,"output_tokens":5}}`)},
+		{Type: "message_stop", Data: []byte(`{"type":"message_stop"}`)},
+	}
+
+	executor := &mockExecutor{streamEvents: streamEvents}
+
+	outbound, err := anthropictransformer.NewOutboundTransformer(channelRow.BaseURL, channelRow.Credentials.APIKey)
+	require.NoError(t, err)
+
+	bizChannel := &biz.Channel{Channel: channelRow, Outbound: outbound}
+	channelSelector := &staticChannelSelector{candidates: channelsToTestCandidates([]*biz.Channel{bizChannel}, "gpt-4")}
+
+	orchestrator := &ChatCompletionOrchestrator{
+		channelSelector:       channelSelector,
+		Inbound:               openai.NewInboundTransformer(),
+		RequestService:        requestService,
+		ChannelService:        channelService,
+		PromptProvider:        &stubPromptProvider{},
+		SystemService:         systemService,
+		UsageLogService:       usageLogService,
+		PipelineFactory:       pipeline.NewFactory(executor),
+		ModelMapper:           NewModelMapper(),
+		channelLimiterManager: NewChannelLimiterManager(),
+		Middlewares: []pipeline.Middleware{
+			stream.EnsureUsage(),
+		},
+	}
+
+	httpRequest := buildTestRequest("gpt-4", "Summarize with citations", true)
+	ctx = contexts.WithProjectID(ctx, project.ID)
+
+	result, err := orchestrator.Process(ctx, httpRequest)
+	require.NoError(t, err)
+	assert.Nil(t, result.ChatCompletion)
+	require.NotNil(t, result.ChatCompletionStream)
+
+	var chunks []*httpclient.StreamEvent
+	for result.ChatCompletionStream.Next() {
+		chunks = append(chunks, result.ChatCompletionStream.Current())
+	}
+	require.NoError(t, result.ChatCompletionStream.Err())
+	require.NoError(t, result.ChatCompletionStream.Close())
+
+	require.NotEmpty(t, chunks)
+
+	var foundAnnotationChunk bool
+	for _, chunk := range chunks {
+		if string(chunk.Data) == "[DONE]" {
+			continue
+		}
+
+		var streamResp openai.Response
+		err := json.Unmarshal(chunk.Data, &streamResp)
+		require.NoError(t, err)
+		if len(streamResp.Choices) == 0 || streamResp.Choices[0].Delta == nil {
+			continue
+		}
+		if len(streamResp.Choices[0].Delta.Annotations) == 0 {
+			continue
+		}
+
+		annotation := streamResp.Choices[0].Delta.Annotations[0]
+		require.Equal(t, "url_citation", annotation.Type)
+		require.NotNil(t, annotation.URLCitation)
+		require.Equal(t, "https://example.com/source", annotation.URLCitation.URL)
+		require.Equal(t, "Example Source", annotation.URLCitation.Title)
+		foundAnnotationChunk = true
+		break
+	}
+	require.True(t, foundAnnotationChunk, "expected at least one streamed chunk carrying annotations")
+
+	requests, err := client.Request.Query().All(ctx)
+	require.NoError(t, err)
+	require.Len(t, requests, 1)
+	assert.Equal(t, request.StatusCompleted, requests[0].Status)
+
+	var persistedResp openai.Response
+	err = json.Unmarshal(requests[0].ResponseBody, &persistedResp)
+	require.NoError(t, err)
+	require.Len(t, persistedResp.Choices, 1)
+	require.NotNil(t, persistedResp.Choices[0].Message)
+	require.Len(t, persistedResp.Choices[0].Message.Annotations, 1)
+	require.Equal(t, "https://example.com/source", persistedResp.Choices[0].Message.Annotations[0].URLCitation.URL)
+	require.Equal(t, "Example Source", persistedResp.Choices[0].Message.Annotations[0].URLCitation.Title)
+
+	require.NotEmpty(t, requests[0].ResponseChunks)
+	var persistedChunk struct {
+		Event string          `json:"event"`
+		Data  json.RawMessage `json:"data"`
+	}
+	var foundPersistedAnnotationChunk bool
+	for _, rawChunk := range requests[0].ResponseChunks {
+		err := json.Unmarshal(rawChunk, &persistedChunk)
+		require.NoError(t, err)
+
+		var streamResp openai.Response
+		err = json.Unmarshal(persistedChunk.Data, &streamResp)
+		require.NoError(t, err)
+		if len(streamResp.Choices) == 0 || streamResp.Choices[0].Delta == nil {
+			continue
+		}
+		if len(streamResp.Choices[0].Delta.Annotations) == 0 {
+			continue
+		}
+
+		annotation := streamResp.Choices[0].Delta.Annotations[0]
+		require.Equal(t, "https://example.com/source", annotation.URLCitation.URL)
+		require.Equal(t, "Example Source", annotation.URLCitation.Title)
+		foundPersistedAnnotationChunk = true
+		break
+	}
+	require.True(t, foundPersistedAnnotationChunk, "expected persisted response_chunks to preserve annotations")
+
+	executions, err := client.RequestExecution.Query().All(ctx)
+	require.NoError(t, err)
+	require.Len(t, executions, 1)
+	assert.Equal(t, requestexecution.StatusCompleted, executions[0].Status)
+}
+
+// TestChatCompletionOrchestrator_Process_Streaming tests the complete streaming flow.
+func TestChatCompletionOrchestrator_Process_Streaming(t *testing.T) {
+	ctx := context.Background()
+	ctx = authz.WithTestBypass(ctx)
+
+	client := enttest.NewEntClient(t, "sqlite3", "file:ent?mode=memory&_fk=0")
+	defer client.Close()
+
+	ctx = ent.NewContext(ctx, client)
+
+	// Setup
+	project := createTestProject(t, ctx, client)
+	ch := createTestChannel(t, ctx, client)
+	channelService, requestService, systemService, usageLogService := setupTestServices(t, client)
+
+	// Create mock stream events
+	streamEvents := []*httpclient.StreamEvent{
+		{
+			Data: []byte(
+				`{"id":"chatcmpl-123","object":"chat.completion.chunk","model":"gpt-4","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}`,
+			),
+		},
+		{Data: []byte(`{"id":"chatcmpl-123","object":"chat.completion.chunk","model":"gpt-4","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}`)},
+		{Data: []byte(`{"id":"chatcmpl-123","object":"chat.completion.chunk","model":"gpt-4","choices":[{"index":0,"delta":{"content":"!"},"finish_reason":null}]}`)},
+		{
+			Data: []byte(
+				`{"id":"chatcmpl-123","object":"chat.completion.chunk","model":"gpt-4","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}`,
+			),
+		},
+	}
+
+	executor := &mockExecutor{
+		streamEvents: streamEvents,
+	}
+
+	// Create outbound transformer
+	outbound, err := openai.NewOutboundTransformer(ch.BaseURL, ch.Credentials.APIKey)
+	require.NoError(t, err)
+
+	// Create channel selector
+	bizChannel := &biz.Channel{
+		Channel:  ch,
+		Outbound: outbound,
+	}
+
+	channelSelector := &staticChannelSelector{candidates: channelsToTestCandidates([]*biz.Channel{bizChannel}, "gpt-4")}
+
+	orchestrator := &ChatCompletionOrchestrator{
+		channelSelector:       channelSelector,
+		Inbound:               openai.NewInboundTransformer(),
+		RequestService:        requestService,
+		ChannelService:        channelService,
+		PromptProvider:        &stubPromptProvider{},
+		SystemService:         systemService,
+		UsageLogService:       usageLogService,
+		PipelineFactory:       pipeline.NewFactory(executor),
+		ModelMapper:           NewModelMapper(),
+		channelLimiterManager: NewChannelLimiterManager(),
+		Middlewares: []pipeline.Middleware{
+			stream.EnsureUsage(),
+		},
+	}
+
+	// Build streaming request
+	httpRequest := buildTestRequest("gpt-4", "Hi!", true)
+
+	// Set project ID in context
+	ctx = contexts.WithProjectID(ctx, project.ID)
+
+	// Execute
+	result, err := orchestrator.Process(ctx, httpRequest)
+
+	// Assert - no error
+	require.NoError(t, err)
+	assert.Nil(t, result.ChatCompletion)
+	assert.NotNil(t, result.ChatCompletionStream)
+
+	// Consume the stream
+	var chunks []*httpclient.StreamEvent
+	for result.ChatCompletionStream.Next() {
+		chunks = append(chunks, result.ChatCompletionStream.Current())
+	}
+
+	err = result.ChatCompletionStream.Close()
+	require.NoError(t, err)
+
+	// Verify chunks were received
+	assert.Len(t, chunks, 4)
+
+	// Verify request was created in database
+	requests, err := client.Request.Query().All(ctx)
+	require.NoError(t, err)
+	require.Len(t, requests, 1)
+
+	dbRequest := requests[0]
+	assert.Equal(t, "gpt-4", dbRequest.ModelID)
+	assert.Equal(t, project.ID, dbRequest.ProjectID)
+
+	// Verify request execution was created
+	executions, err := client.RequestExecution.Query().All(ctx)
+	require.NoError(t, err)
+	require.Len(t, executions, 1)
+
+	dbExec := executions[0]
+	assert.Equal(t, ch.ID, dbExec.ChannelID)
+	assert.Equal(t, dbRequest.ID, dbExec.RequestID)
+}
+
+// TestChatCompletionOrchestrator_Process_StreamingError tests that mid-stream errors
+// properly mark both request and request execution as failed.
+func TestChatCompletionOrchestrator_Process_StreamingError(t *testing.T) {
+	ctx := context.Background()
+	ctx = authz.WithTestBypass(ctx)
+
+	client := enttest.NewEntClient(t, "sqlite3", "file:ent?mode=memory&_fk=0")
+	defer client.Close()
+
+	ctx = ent.NewContext(ctx, client)
+
+	// Setup
+	project := createTestProject(t, ctx, client)
+	ch := createTestChannel(t, ctx, client)
+	channelService, requestService, systemService, usageLogService := setupTestServices(t, client)
+
+	// Create a stream that emits some events then errors
+	midStreamErr := errors.New("upstream connection reset")
+	executor := &mockExecutorWithErrorStream{
+		events: []*httpclient.StreamEvent{
+			{
+				Data: []byte(
+					`{"id":"chatcmpl-err","object":"chat.completion.chunk","model":"gpt-4","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}`,
+				),
+			},
+			{Data: []byte(`{"id":"chatcmpl-err","object":"chat.completion.chunk","model":"gpt-4","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}`)},
+		},
+		streamErr: midStreamErr,
+	}
+
+	// Create outbound transformer
+	outbound, err := openai.NewOutboundTransformer(ch.BaseURL, ch.Credentials.APIKey)
+	require.NoError(t, err)
+
+	bizChannel := &biz.Channel{
+		Channel:  ch,
+		Outbound: outbound,
+	}
+
+	channelSelector := &staticChannelSelector{candidates: channelsToTestCandidates([]*biz.Channel{bizChannel}, "gpt-4")}
+
+	orchestrator := &ChatCompletionOrchestrator{
+		channelSelector:       channelSelector,
+		Inbound:               openai.NewInboundTransformer(),
+		RequestService:        requestService,
+		ChannelService:        channelService,
+		PromptProvider:        &stubPromptProvider{},
+		SystemService:         systemService,
+		UsageLogService:       usageLogService,
+		PipelineFactory:       pipeline.NewFactory(executor),
+		ModelMapper:           NewModelMapper(),
+		channelLimiterManager: NewChannelLimiterManager(),
+		Middlewares: []pipeline.Middleware{
+			stream.EnsureUsage(),
+		},
+	}
+
+	// Build streaming request
+	httpRequest := buildTestRequest("gpt-4", "Hi!", true)
+	ctx = contexts.WithProjectID(ctx, project.ID)
+
+	// Execute - the stream should be established successfully
+	result, err := orchestrator.Process(ctx, httpRequest)
+	require.NoError(t, err)
+	assert.Nil(t, result.ChatCompletion)
+	assert.NotNil(t, result.ChatCompletionStream)
+
+	// Consume the stream - it should error mid-way
+	var chunks []*httpclient.StreamEvent
+	for result.ChatCompletionStream.Next() {
+		chunks = append(chunks, result.ChatCompletionStream.Current())
+	}
+
+	// Verify stream error
+	assert.Error(t, result.ChatCompletionStream.Err())
+
+	// Close the stream (triggers persistence)
+	err = result.ChatCompletionStream.Close()
+	require.NoError(t, err)
+
+	// Verify request was created and marked as failed
+	requests, err := client.Request.Query().All(ctx)
+	require.NoError(t, err)
+	require.Len(t, requests, 1)
+
+	dbRequest := requests[0]
+	assert.Equal(t, request.StatusFailed, dbRequest.Status, "request should be marked as failed on stream error")
+
+	// Verify request execution was created and marked as failed
+	executions, err := client.RequestExecution.Query().All(ctx)
+	require.NoError(t, err)
+	require.Len(t, executions, 1)
+
+	dbExec := executions[0]
+	assert.Equal(t, requestexecution.StatusFailed, dbExec.Status, "request execution should be marked as failed on stream error")
+}
+
+// TestChatCompletionOrchestrator_Process_StreamingSuccess_NotMarkedAsError verifies that
+// a successfully completed stream does NOT mark request/execution as failed.
+func TestChatCompletionOrchestrator_Process_StreamingSuccess_NotMarkedAsError(t *testing.T) {
+	ctx := context.Background()
+	ctx = authz.WithTestBypass(ctx)
+
+	client := enttest.NewEntClient(t, "sqlite3", "file:ent?mode=memory&_fk=0")
+	defer client.Close()
+
+	ctx = ent.NewContext(ctx, client)
+
+	// Setup
+	project := createTestProject(t, ctx, client)
+	ch := createTestChannel(t, ctx, client)
+	channelService, requestService, systemService, usageLogService := setupTestServices(t, client)
+
+	streamEvents := []*httpclient.StreamEvent{
+		{
+			Data: []byte(
+				`{"id":"chatcmpl-ok","object":"chat.completion.chunk","model":"gpt-4","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}`,
+			),
+		},
+		{Data: []byte(`{"id":"chatcmpl-ok","object":"chat.completion.chunk","model":"gpt-4","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}`)},
+		{
+			Data: []byte(
+				`{"id":"chatcmpl-ok","object":"chat.completion.chunk","model":"gpt-4","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}`,
+			),
+		},
+	}
+
+	executor := &mockExecutor{streamEvents: streamEvents}
+
+	outbound, err := openai.NewOutboundTransformer(ch.BaseURL, ch.Credentials.APIKey)
+	require.NoError(t, err)
+
+	bizChannel := &biz.Channel{
+		Channel:  ch,
+		Outbound: outbound,
+	}
+
+	channelSelector := &staticChannelSelector{candidates: channelsToTestCandidates([]*biz.Channel{bizChannel}, "gpt-4")}
+
+	orchestrator := &ChatCompletionOrchestrator{
+		channelSelector:       channelSelector,
+		Inbound:               openai.NewInboundTransformer(),
+		RequestService:        requestService,
+		ChannelService:        channelService,
+		PromptProvider:        &stubPromptProvider{},
+		SystemService:         systemService,
+		UsageLogService:       usageLogService,
+		PipelineFactory:       pipeline.NewFactory(executor),
+		ModelMapper:           NewModelMapper(),
+		channelLimiterManager: NewChannelLimiterManager(),
+		Middlewares: []pipeline.Middleware{
+			stream.EnsureUsage(),
+		},
+	}
+
+	httpRequest := buildTestRequest("gpt-4", "Hi!", true)
+	ctx = contexts.WithProjectID(ctx, project.ID)
+
+	result, err := orchestrator.Process(ctx, httpRequest)
+	require.NoError(t, err)
+	assert.NotNil(t, result.ChatCompletionStream)
+
+	// Consume stream fully
+	for result.ChatCompletionStream.Next() {
+		_ = result.ChatCompletionStream.Current()
+	}
+
+	require.NoError(t, result.ChatCompletionStream.Err())
+
+	err = result.ChatCompletionStream.Close()
+	require.NoError(t, err)
+
+	// Verify request is completed, NOT failed
+	requests, err := client.Request.Query().All(ctx)
+	require.NoError(t, err)
+	require.Len(t, requests, 1)
+
+	dbRequest := requests[0]
+	assert.Equal(t, request.StatusCompleted, dbRequest.Status, "successful stream should be marked as completed")
+
+	// Verify request execution is completed
+	executions, err := client.RequestExecution.Query().All(ctx)
+	require.NoError(t, err)
+	require.Len(t, executions, 1)
+
+	dbExec := executions[0]
+	assert.Equal(t, requestexecution.StatusCompleted, dbExec.Status, "successful stream execution should be marked as completed")
+}
+
+// mockExecutorWithErrorStream returns a stream that emits events then errors.
+type mockExecutorWithErrorStream struct {
+	events    []*httpclient.StreamEvent
+	streamErr error
+}
+
+func (m *mockExecutorWithErrorStream) Do(_ context.Context, _ *httpclient.Request) (*httpclient.Response, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (m *mockExecutorWithErrorStream) DoStream(_ context.Context, _ *httpclient.Request) (streams.Stream[*httpclient.StreamEvent], error) {
+	return &errorAfterEventsStream{
+		items: m.events,
+		err:   m.streamErr,
+	}, nil
+}
+
+// errorAfterEventsStream emits all items then returns an error.
+type errorAfterEventsStream struct {
+	items []*httpclient.StreamEvent
+	idx   int
+	err   error
+}
+
+func (s *errorAfterEventsStream) Next() bool {
+	return s.idx < len(s.items)
+}
+
+func (s *errorAfterEventsStream) Current() *httpclient.StreamEvent {
+	item := s.items[s.idx]
+	s.idx++
+
+	return item
+}
+
+func (s *errorAfterEventsStream) Err() error {
+	if s.idx >= len(s.items) {
+		return s.err
+	}
+
+	return nil
+}
+
+func (s *errorAfterEventsStream) Close() error { return nil }
+
+// TestChatCompletionOrchestrator_Process_QueueRejectionDoesNotConsumeRPM is a
+// regression test for the middleware ordering invariant: channel admission must
+// run BEFORE rate-limit tracking so a locally rejected request does not bump the
+// per-channel RPM counter for a request that never reached upstream. Reversing
+// the order would let a flood of queue rejections push the channel into a false
+// "RPM exhausted" state and force avoidable failover.
+func TestChatCompletionOrchestrator_Process_QueueRejectionDoesNotConsumeRPM(t *testing.T) {
+	ctx := context.Background()
+	ctx = authz.WithTestBypass(ctx)
+
+	client := enttest.NewEntClient(t, "sqlite3", "file:ent?mode=memory&_fk=0")
+	defer client.Close()
+
+	ctx = ent.NewContext(ctx, client)
+
+	project := createTestProject(t, ctx, client)
+	ch := createTestChannel(t, ctx, client)
+	channelService, requestService, systemService, usageLogService := setupTestServices(t, client)
+
+	mockResp := buildMockOpenAIResponse("chatcmpl-rpm", "gpt-4", "rpm test", 5, 10)
+	executor := &mockExecutor{
+		response: &httpclient.Response{
+			StatusCode: 200,
+			Body:       mockResp,
+			Headers:    http.Header{"Content-Type": []string{"application/json"}},
+		},
+	}
+
+	outbound, err := openai.NewOutboundTransformer(ch.BaseURL, ch.Credentials.APIKey)
+	require.NoError(t, err)
+
+	maxConcurrent := int64(1)
+	queueSize := int64(2)
+	queueTimeoutMs := int64(30)
+	bizChannel := &biz.Channel{
+		Channel: &ent.Channel{
+			ID:               ch.ID,
+			Name:             ch.Name,
+			BaseURL:          ch.BaseURL,
+			Credentials:      ch.Credentials,
+			SupportedModels:  ch.SupportedModels,
+			DefaultTestModel: ch.DefaultTestModel,
+			Status:           ch.Status,
+			Settings: &objects.ChannelSettings{
+				RateLimit: &objects.ChannelRateLimit{
+					MaxConcurrent:  &maxConcurrent,
+					QueueSize:      &queueSize,
+					QueueTimeoutMs: &queueTimeoutMs,
+				},
+			},
+		},
+		Outbound: outbound,
+	}
+
+	channelSelector := &staticChannelSelector{candidates: channelsToTestCandidates([]*biz.Channel{bizChannel}, "gpt-4")}
+
+	mgr := NewChannelLimiterManager()
+	rateLimitTracker := NewChannelRequestTracker()
+
+	// Saturate capacity externally so the orchestrator's Acquire must enter the
+	// queue and eventually hit the per-channel timeout.
+	lim := mgr.GetOrCreate(bizChannel)
+	require.NotNil(t, lim)
+	require.NoError(t, lim.Acquire(ctx))
+	defer lim.Release()
+
+	orchestrator := &ChatCompletionOrchestrator{
+		channelSelector:       channelSelector,
+		Inbound:               openai.NewInboundTransformer(),
+		RequestService:        requestService,
+		ChannelService:        channelService,
+		PromptProvider:        &stubPromptProvider{},
+		SystemService:         systemService,
+		UsageLogService:       usageLogService,
+		PipelineFactory:       pipeline.NewFactory(executor),
+		ModelMapper:           NewModelMapper(),
+		channelLimiterManager: mgr,
+		rateLimitTracker:      rateLimitTracker,
+		Middlewares: []pipeline.Middleware{
+			stream.EnsureUsage(),
+		},
+	}
+
+	httpRequest := buildTestRequest("gpt-4", "rpm test", false)
+	ctx = contexts.WithProjectID(ctx, project.ID)
+
+	_, err = orchestrator.Process(ctx, httpRequest)
+	require.Error(t, err)
+
+	var queueErr *ChannelQueueError
+	require.ErrorAs(t, err, &queueErr, "expected channel queue rejection")
+	assert.Equal(t, channelQueueReasonTimeout, queueErr.Reason)
+
+	assert.Zero(t, rateLimitTracker.GetRequestCount(ch.ID),
+		"queue rejection must not consume RPM budget — middleware order regression")
+}
+
+func TestChatCompletionOrchestrator_Process_RPMAdmissionBlocksBeforeUpstream(t *testing.T) {
+	ctx := context.Background()
+	ctx = authz.WithTestBypass(ctx)
+
+	client := enttest.NewEntClient(t, "sqlite3", "file:ent?mode=memory&_fk=0")
+	defer client.Close()
+
+	ctx = ent.NewContext(ctx, client)
+
+	project := createTestProject(t, ctx, client)
+	ch := createTestChannel(t, ctx, client)
+	channelService, requestService, systemService, usageLogService := setupTestServices(t, client)
+
+	mockResp := buildMockOpenAIResponse("chatcmpl-rpm", "gpt-4", "rpm test", 5, 10)
+	executor := &mockExecutor{
+		response: &httpclient.Response{
+			StatusCode: 200,
+			Body:       mockResp,
+			Headers:    http.Header{"Content-Type": []string{"application/json"}},
+		},
+	}
+
+	outbound, err := openai.NewOutboundTransformer(ch.BaseURL, ch.Credentials.APIKey)
+	require.NoError(t, err)
+
+	rpm := int64(1)
+	bizChannel := &biz.Channel{
+		Channel: &ent.Channel{
+			ID:               ch.ID,
+			Name:             ch.Name,
+			BaseURL:          ch.BaseURL,
+			Credentials:      ch.Credentials,
+			SupportedModels:  ch.SupportedModels,
+			DefaultTestModel: ch.DefaultTestModel,
+			Status:           ch.Status,
+			Settings: &objects.ChannelSettings{
+				RateLimit: &objects.ChannelRateLimit{RPM: &rpm},
+			},
+		},
+		Outbound: outbound,
+	}
+
+	channelSelector := &staticChannelSelector{candidates: channelsToTestCandidates([]*biz.Channel{bizChannel}, "gpt-4")}
+	rateLimitTracker := NewChannelRequestTracker()
+
+	orchestrator := &ChatCompletionOrchestrator{
+		channelSelector:       channelSelector,
+		Inbound:               openai.NewInboundTransformer(),
+		RequestService:        requestService,
+		ChannelService:        channelService,
+		PromptProvider:        &stubPromptProvider{},
+		SystemService:         systemService,
+		UsageLogService:       usageLogService,
+		PipelineFactory:       pipeline.NewFactory(executor),
+		ModelMapper:           NewModelMapper(),
+		channelLimiterManager: NewChannelLimiterManager(),
+		rateLimitTracker:      rateLimitTracker,
+		Middlewares: []pipeline.Middleware{
+			stream.EnsureUsage(),
+		},
+	}
+
+	ctx = contexts.WithProjectID(ctx, project.ID)
+
+	firstRequest := buildTestRequest("gpt-4", "rpm test", false)
+	result, err := orchestrator.Process(ctx, firstRequest)
+	require.NoError(t, err)
+	require.NotNil(t, result.ChatCompletion)
+
+	secondRequest := buildTestRequest("gpt-4", "rpm test", false)
+	_, err = orchestrator.Process(ctx, secondRequest)
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrLocalRPMExhausted)
+
+	var rpmErr *LocalRPMExhaustedError
+	require.ErrorAs(t, err, &rpmErr)
+	assert.Equal(t, ch.ID, rpmErr.ChannelID)
+	assert.Equal(t, int64(1), rateLimitTracker.GetRequestCount(ch.ID))
+	assert.Equal(t, int64(1), executor.requestCalls.Load(), "RPM rejection must not reach upstream")
+}
+
+// TestChatCompletionOrchestrator_Process_ChannelLimiter exercises the channel admission
+// middleware end-to-end: configure a channel with MaxConcurrent + QueueSize, run a
+// request through the orchestrator, and confirm the limiter slot is released after
+// completion.
+func TestChatCompletionOrchestrator_Process_ChannelLimiter(t *testing.T) {
+	ctx := context.Background()
+	ctx = authz.WithTestBypass(ctx)
+
+	client := enttest.NewEntClient(t, "sqlite3", "file:ent?mode=memory&_fk=0")
+	defer client.Close()
+
+	ctx = ent.NewContext(ctx, client)
+
+	project := createTestProject(t, ctx, client)
+	ch := createTestChannel(t, ctx, client)
+	channelService, requestService, systemService, usageLogService := setupTestServices(t, client)
+
+	mockResp := buildMockOpenAIResponse("chatcmpl-conn", "gpt-4", "Connection test", 5, 10)
+	executor := &mockExecutor{
+		response: &httpclient.Response{
+			StatusCode: 200,
+			Body:       mockResp,
+			Headers:    http.Header{"Content-Type": []string{"application/json"}},
+		},
+	}
+
+	outbound, err := openai.NewOutboundTransformer(ch.BaseURL, ch.Credentials.APIKey)
+	require.NoError(t, err)
+
+	maxConcurrent := int64(2)
+	queueSize := int64(5)
+	bizChannel := &biz.Channel{
+		Channel: &ent.Channel{
+			ID:               ch.ID,
+			Name:             ch.Name,
+			BaseURL:          ch.BaseURL,
+			Credentials:      ch.Credentials,
+			SupportedModels:  ch.SupportedModels,
+			DefaultTestModel: ch.DefaultTestModel,
+			Status:           ch.Status,
+			Settings: &objects.ChannelSettings{
+				RateLimit: &objects.ChannelRateLimit{
+					MaxConcurrent: &maxConcurrent,
+					QueueSize:     &queueSize,
+				},
+			},
+		},
+		Outbound: outbound,
+	}
+
+	channelSelector := &staticChannelSelector{candidates: channelsToTestCandidates([]*biz.Channel{bizChannel}, "gpt-4")}
+
+	mgr := NewChannelLimiterManager()
+
+	orchestrator := &ChatCompletionOrchestrator{
+		channelSelector:       channelSelector,
+		Inbound:               openai.NewInboundTransformer(),
+		RequestService:        requestService,
+		ChannelService:        channelService,
+		PromptProvider:        &stubPromptProvider{},
+		SystemService:         systemService,
+		UsageLogService:       usageLogService,
+		PipelineFactory:       pipeline.NewFactory(executor),
+		ModelMapper:           NewModelMapper(),
+		channelLimiterManager: mgr,
+		Middlewares: []pipeline.Middleware{
+			stream.EnsureUsage(),
+		},
+	}
+
+	httpRequest := buildTestRequest("gpt-4", "Connection test", false)
+	ctx = contexts.WithProjectID(ctx, project.ID)
+
+	result, err := orchestrator.Process(ctx, httpRequest)
+	require.NoError(t, err)
+	assert.NotNil(t, result.ChatCompletion)
+
+	inFlight, waiting, ok := mgr.Stats(ch.ID)
+	require.True(t, ok, "limiter should have been created for the configured channel")
+	assert.Equal(t, 0, inFlight, "slot must be released after request completion")
+	assert.Equal(t, 0, waiting)
+}
