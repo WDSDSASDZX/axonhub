@@ -4,9 +4,12 @@ version = "0.1.0"
 description = "A small asynchronous AI gateway inspired by AxonHub"
 requires-python = ">=3.12"
 dependencies = [
+  "aiosqlite>=0.20,<1",
+  "cryptography>=44",
   "fastapi>=0.115,<1",
   "httpx>=0.28,<1",
   "pydantic-settings>=2.7,<3",
+  "sqlalchemy[asyncio]>=2.0,<3",
   "uvicorn>=0.34,<1",
 ]
 
