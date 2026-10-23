@@ -1,0 +1,559 @@
+package orchestrator
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"mime"
+	"net/http"
+	"strings"
+	"text/template"
+
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
+
+	"github.com/looplj/axonhub/internal/log"
+	"github.com/looplj/axonhub/internal/objects"
+	"github.com/looplj/axonhub/llm"
+	"github.com/looplj/axonhub/llm/httpclient"
+	"github.com/looplj/axonhub/llm/pipeline"
+)
+
+// RenderContext is the context used for rendering override templates.
+type RenderContext struct {
+	// RequestModel is the model used in the original request.
+	RequestModel string `json:"request_model"`
+	// Model is the model sent to the LLM service.
+	Model string `json:"model"`
+	// Metadata is the metadata used in the current request.
+	Metadata map[string]string `json:"metadata"`
+	// RequestHeader is the filtered request headers used in the current request.
+	RequestHeader map[string]string `json:"request_header"`
+	// PromptCacheKey is the prompt cache key provided by the original request.
+	PromptCacheKey string `json:"prompt_cache_key"`
+	// ReasoningEffort is the reasoning effort used in the current request.
+	ReasoningEffort string `json:"reasoning_effort"`
+}
+
+var overrideTemplateFuncs = template.FuncMap{
+	"toJSON": func(value any) (string, error) {
+		data, err := json.Marshal(value)
+		if err != nil {
+			return "", err
+		}
+		return string(data), nil
+	},
+}
+
+func buildRequestHeaderMap(llmReq *llm.Request) map[string]string {
+	requestHeaders := make(map[string]string)
+	if llmReq == nil || llmReq.RawRequest == nil || llmReq.RawRequest.Headers == nil {
+		return requestHeaders
+	}
+
+	for key, values := range llmReq.RawRequest.Headers {
+		if len(values) == 0 {
+			continue
+		}
+
+		if httpclient.IsSensitiveHeader(key) {
+			continue
+		}
+
+		value := values[0]
+		canonicalKey := http.CanonicalHeaderKey(key)
+		requestHeaders[canonicalKey] = value
+		requestHeaders[strings.ToLower(key)] = value
+	}
+
+	return requestHeaders
+}
+
+func buildRenderContext(llmReq *llm.Request, requestModel string) RenderContext {
+	renderCtx := RenderContext{
+		RequestModel:    requestModel,
+		Model:           llmReq.Model,
+		Metadata:        llmReq.Metadata,
+		RequestHeader:   buildRequestHeaderMap(llmReq),
+		ReasoningEffort: llmReq.ReasoningEffort,
+	}
+	if llmReq.PromptCacheKey != nil {
+		renderCtx.PromptCacheKey = *llmReq.PromptCacheKey
+	} else if llmReq.Compact != nil {
+		renderCtx.PromptCacheKey = llmReq.Compact.PromptCacheKey
+	}
+
+	return renderCtx
+}
+
+// renderTemplate renders a Go template string against RenderContext. Returns the original value on error.
+func renderTemplate(ctx context.Context, value string, renderCtx RenderContext) string {
+	if !strings.Contains(value, "{{") || !strings.Contains(value, "}}") {
+		return value
+	}
+
+	tmpl, err := template.New("override").Funcs(overrideTemplateFuncs).Parse(value)
+	if err != nil {
+		log.Warn(ctx, "failed to parse override template",
+			log.String("template", value),
+			log.Cause(err),
+		)
+
+		return value
+	}
+
+	var buf bytes.Buffer
+	if err := tmpl.Execute(&buf, renderCtx); err != nil {
+		log.Warn(ctx, "failed to execute override template", log.String("template", value), log.Cause(err))
+		return value
+	}
+
+	return buf.String()
+}
+
+// renderOverrideValue renders a template string using RenderContext derived from llm.Request.
+// It also attempts to parse the result as JSON if it looks like a structured value (object, array) or a number/boolean/null.
+func renderOverrideValue(ctx context.Context, value string, renderCtx RenderContext) any {
+	rendered := renderTemplate(ctx, value, renderCtx)
+
+	trimmed := strings.TrimSpace(rendered)
+	if trimmed == "" {
+		return rendered
+	}
+
+	firstChar := trimmed[0]
+	if firstChar == '{' || firstChar == '[' || (firstChar >= '0' && firstChar <= '9') || firstChar == '-' ||
+		trimmed == "true" || trimmed == "false" || trimmed == "null" {
+		var jsonVal any
+		if json.Unmarshal([]byte(trimmed), &jsonVal) == nil {
+			return jsonVal
+		}
+	}
+
+	return rendered
+}
+
+// evaluateCondition renders the condition template and returns true
+// if the result (trimmed) equals "true". Empty condition means always execute.
+func evaluateCondition(ctx context.Context, condition string, renderCtx RenderContext) bool {
+	if condition == "" {
+		return true
+	}
+
+	rendered := renderTemplate(ctx, condition, renderCtx)
+
+	return strings.TrimSpace(rendered) == "true"
+}
+
+// applyOverrideRequestBody creates a middleware that applies channel override operations.
+func applyOverrideRequestBody(outbound *PersistentOutboundTransformer) pipeline.Middleware {
+	return pipeline.OnRawRequest("override-request-body", func(ctx context.Context, request *httpclient.Request) (*httpclient.Request, error) {
+		channel := outbound.GetCurrentChannel()
+
+		ops := channel.GetBodyOverrideOperations()
+		if len(ops) == 0 {
+			return request, nil
+		}
+
+		// Body override operations are implemented with sjson, which silently discards a
+		// non-JSON document and rebuilds it as a fresh JSON object. Applying them to a
+		// multipart body (image edit/variation, transcription, ...) would replace the whole
+		// payload with a tiny JSON object while the Content-Type still advertises the
+		// multipart boundary, so the upstream sees a truncated form.
+		if !bodyOverrideSupported(request) {
+			log.Warn(ctx, "skipping body override operations for non-JSON request body",
+				log.String("channel", channel.Name),
+				log.Int("channel_id", channel.ID),
+				log.String("content_type", requestContentType(request)),
+				log.String("api_format", request.APIFormat),
+			)
+
+			return request, nil
+		}
+
+		llmReq := outbound.state.LlmRequest
+		renderCtx := buildRenderContext(llmReq, outbound.state.OriginalModel)
+		body := request.Body
+
+		for _, op := range ops {
+			if strings.EqualFold(op.Path, "stream") {
+				log.Warn(ctx, "stream override parameter ignored",
+					log.String("channel", channel.Name),
+					log.Int("channel_id", channel.ID),
+				)
+
+				continue
+			}
+
+			var err error
+
+			body, err = applyBodyOperation(ctx, body, op, renderCtx)
+			if err != nil {
+				log.Warn(ctx, "failed to apply override operation",
+					log.String("channel", channel.Name),
+					log.String("op", op.Op),
+					log.String("path", op.Path),
+					log.Cause(err),
+				)
+			}
+		}
+
+		if log.DebugEnabled(ctx) {
+			log.Debug(ctx, "applied body override operations",
+				log.String("channel", channel.Name),
+				log.Int("channel_id", channel.ID),
+				log.Any("operations", ops),
+				log.String("old_body", string(request.Body)),
+				log.String("new_body", string(body)),
+			)
+		}
+
+		request.Body = body
+
+		return request, nil
+	})
+}
+
+// requestContentType returns the effective outbound Content-Type, preferring the
+// explicit field and falling back to the header.
+func requestContentType(request *httpclient.Request) string {
+	if request == nil {
+		return ""
+	}
+
+	if request.ContentType != "" {
+		return request.ContentType
+	}
+
+	return request.Headers.Get("Content-Type")
+}
+
+// bodyOverrideSupported reports whether channel body override operations can safely be
+// applied to the outbound request body. Only JSON bodies are patchable: sjson treats any
+// non-JSON input as an empty document and returns a freshly built object, which would
+// destroy multipart and binary payloads.
+func bodyOverrideSupported(request *httpclient.Request) bool {
+	if request == nil || len(request.Body) == 0 {
+		return false
+	}
+
+	contentType := requestContentType(request)
+	if contentType != "" {
+		mediaType, _, err := mime.ParseMediaType(contentType)
+		if err == nil && !isJSONMediaType(mediaType) {
+			return false
+		}
+	}
+
+	return gjson.ValidBytes(request.Body)
+}
+
+func isJSONMediaType(mediaType string) bool {
+	mediaType = strings.ToLower(mediaType)
+
+	return mediaType == "application/json" ||
+		mediaType == "text/json" ||
+		strings.HasSuffix(mediaType, "+json")
+}
+
+func applyBodyOperation(
+	ctx context.Context,
+	body []byte,
+	op objects.OverrideOperation,
+	renderCtx RenderContext,
+) ([]byte, error) {
+	if !evaluateCondition(ctx, op.Condition, renderCtx) {
+		return body, nil
+	}
+
+	switch op.Op {
+	case objects.OverrideOpSet:
+		return applyBodySet(ctx, body, op, renderCtx)
+	case objects.OverrideOpSetIfAbsent:
+		return applyBodySetIfAbsent(ctx, body, op, renderCtx)
+	case objects.OverrideOpDelete:
+		return applyBodyDelete(body, op)
+	case objects.OverrideOpRename:
+		return applyBodyRename(body, op)
+	case objects.OverrideOpCopy:
+		return applyBodyCopy(body, op)
+	case objects.OverrideOpArrayAppend:
+		return applyBodyArrayInsert(ctx, body, op, renderCtx, arrayInsertAtEnd)
+	case objects.OverrideOpArrayPrepend:
+		return applyBodyArrayInsert(ctx, body, op, renderCtx, arrayInsertAtStart)
+	case objects.OverrideOpArrayInsert:
+		return applyBodyArrayInsert(ctx, body, op, renderCtx, arrayInsertAtIndex)
+	case objects.OverrideOpArrayRemove:
+		return applyBodyArrayRemove(body, op)
+	default:
+		log.Warn(ctx, "unknown override operation",
+			log.String("op", op.Op),
+		)
+
+		return body, nil
+	}
+}
+
+func applyBodySet(
+	ctx context.Context,
+	body []byte,
+	op objects.OverrideOperation,
+	renderCtx RenderContext,
+) ([]byte, error) {
+	renderedValue := renderOverrideValue(ctx, op.Value, renderCtx)
+
+	if renderedValue == "__AXONHUB_CLEAR__" {
+		return sjson.DeleteBytes(body, op.Path)
+	}
+
+	return sjson.SetBytes(body, op.Path, renderedValue)
+}
+
+func applyBodySetIfAbsent(
+	ctx context.Context,
+	body []byte,
+	op objects.OverrideOperation,
+	renderCtx RenderContext,
+) ([]byte, error) {
+	existing := gjson.GetBytes(body, op.Path)
+	if existing.Exists() || existing.Raw == "null" {
+		return body, nil
+	}
+
+	return applyBodySet(ctx, body, op, renderCtx)
+}
+
+func applyBodyDelete(body []byte, op objects.OverrideOperation) ([]byte, error) {
+	return sjson.DeleteBytes(body, op.Path)
+}
+
+func applyBodyRename(body []byte, op objects.OverrideOperation) ([]byte, error) {
+	result := gjson.GetBytes(body, op.From)
+	if !result.Exists() {
+		return body, nil
+	}
+
+	body, err := sjson.DeleteBytes(body, op.From)
+	if err != nil {
+		return body, err
+	}
+
+	return sjson.SetBytes(body, op.To, result.Value())
+}
+
+func applyBodyCopy(body []byte, op objects.OverrideOperation) ([]byte, error) {
+	result := gjson.GetBytes(body, op.From)
+	if !result.Exists() {
+		return body, nil
+	}
+
+	return sjson.SetBytes(body, op.To, result.Value())
+}
+
+type arrayInsertMode int
+
+const (
+	arrayInsertAtStart arrayInsertMode = iota
+	arrayInsertAtEnd
+	arrayInsertAtIndex
+)
+
+// applyBodyArrayInsert inserts one or more values into an array at the requested position.
+// Behavior:
+//   - If the rendered value is a JSON array and op.Splat is nil or true, its elements are
+//     spread into the target array. Set Splat=false to insert the array as a single nested element.
+//   - When the target path does not exist, a new array is created with the value(s).
+//   - When the target path exists but is not an array, an error is returned.
+//   - For arrayInsertAtIndex, op.Index is required and may be negative (counted from the end).
+//     Out-of-range indexes are clamped to [0, len].
+func applyBodyArrayInsert(
+	ctx context.Context,
+	body []byte,
+	op objects.OverrideOperation,
+	renderCtx RenderContext,
+	mode arrayInsertMode,
+) ([]byte, error) {
+	if op.Path == "" {
+		return body, fmt.Errorf("array op requires a path")
+	}
+
+	rendered := renderOverrideValue(ctx, op.Value, renderCtx)
+
+	splat := true
+	if op.Splat != nil {
+		splat = *op.Splat
+	}
+
+	var toInsert []any
+
+	if arr, ok := rendered.([]any); ok && splat {
+		toInsert = arr
+	} else {
+		toInsert = []any{rendered}
+	}
+
+	existing := gjson.GetBytes(body, op.Path)
+	if !existing.Exists() {
+		// Create a new array at the path. For arrayInsertAtIndex with a non-zero index,
+		// the position is effectively clamped to 0 since the array is empty.
+		return sjson.SetBytes(body, op.Path, toInsert)
+	}
+
+	if !existing.IsArray() {
+		return body, fmt.Errorf("path %q is not an array", op.Path)
+	}
+
+	var current []any
+	if err := json.Unmarshal([]byte(existing.Raw), &current); err != nil {
+		return body, fmt.Errorf("decode array at %q: %w", op.Path, err)
+	}
+
+	var pos int
+
+	switch mode {
+	case arrayInsertAtStart:
+		pos = 0
+	case arrayInsertAtEnd:
+		pos = len(current)
+	case arrayInsertAtIndex:
+		if op.Index == nil {
+			return body, fmt.Errorf("array_insert requires an index")
+		}
+
+		pos = *op.Index
+		if pos < 0 {
+			pos = len(current) + pos
+		}
+
+		if pos < 0 {
+			pos = 0
+		}
+
+		if pos > len(current) {
+			pos = len(current)
+		}
+	}
+
+	merged := make([]any, 0, len(current)+len(toInsert))
+	merged = append(merged, current[:pos]...)
+	merged = append(merged, toInsert...)
+	merged = append(merged, current[pos:]...)
+
+	return sjson.SetBytes(body, op.Path, merged)
+}
+
+// applyBodyArrayRemove removes array items whose relative match path equals the configured value.
+func applyBodyArrayRemove(body []byte, op objects.OverrideOperation) ([]byte, error) {
+	if op.Path == "" {
+		return body, fmt.Errorf("array_remove requires a path")
+	}
+
+	if op.Match == nil {
+		return body, fmt.Errorf("array_remove requires a match")
+	}
+
+	if strings.TrimSpace(op.Match.Path) == "" {
+		return body, fmt.Errorf("array_remove requires a match path")
+	}
+
+	if strings.TrimSpace(op.Match.Eq) == "" {
+		return body, fmt.Errorf("array_remove requires a match eq value")
+	}
+
+	existing := gjson.GetBytes(body, op.Path)
+	if !existing.Exists() {
+		return body, nil
+	}
+
+	if !existing.IsArray() {
+		return body, fmt.Errorf("path %q is not an array", op.Path)
+	}
+
+	matchEq := strings.TrimSpace(op.Match.Eq)
+	items := existing.Array()
+	kept := make([]json.RawMessage, 0, len(items))
+	for _, item := range items {
+		result := gjson.GetBytes([]byte(item.Raw), op.Match.Path)
+		if result.Exists() && result.String() == matchEq {
+			continue
+		}
+
+		kept = append(kept, json.RawMessage([]byte(item.Raw)))
+	}
+
+	return sjson.SetBytes(body, op.Path, kept)
+}
+
+func applyOverrideOperationToHeaders(
+	ctx context.Context,
+	headers http.Header,
+	op objects.OverrideOperation,
+	renderCtx RenderContext,
+) {
+	if !evaluateCondition(ctx, op.Condition, renderCtx) {
+		return
+	}
+
+	switch op.Op {
+	case objects.OverrideOpSet:
+		renderedValue := renderTemplate(ctx, op.Value, renderCtx)
+		// For backward compatibility, we still support "__AXONHUB_CLEAR__" to clear the header.
+		if renderedValue == "__AXONHUB_CLEAR__" {
+			headers.Del(op.Path)
+			return
+		}
+
+		headers.Set(op.Path, renderedValue)
+	case objects.OverrideOpDelete:
+		headers.Del(op.Path)
+	case objects.OverrideOpRename:
+		values := headers.Values(op.From)
+		if len(values) == 0 {
+			return
+		}
+
+		headers.Del(op.From)
+
+		for _, v := range values {
+			headers.Add(op.To, v)
+		}
+	case objects.OverrideOpCopy:
+		values := headers.Values(op.From)
+		for _, v := range values {
+			headers.Add(op.To, v)
+		}
+	default:
+		log.Warn(ctx, "unknown header override operation",
+			log.String("op", op.Op),
+		)
+	}
+}
+
+// applyOverrideRequestHeaders creates a middleware that applies channel override headers.
+func applyOverrideRequestHeaders(outbound *PersistentOutboundTransformer) pipeline.Middleware {
+	return pipeline.OnRawRequest("override-request-headers", func(ctx context.Context, request *httpclient.Request) (*httpclient.Request, error) {
+		channel := outbound.GetCurrentChannel()
+		if channel == nil {
+			return request, nil
+		}
+
+		overrideHeaders := channel.GetHeaderOverrideOperations()
+		if len(overrideHeaders) == 0 {
+			return request, nil
+		}
+
+		if request.Headers == nil {
+			request.Headers = make(http.Header)
+		}
+
+		llmReq := outbound.state.LlmRequest
+		renderCtx := buildRenderContext(llmReq, outbound.state.OriginalModel)
+
+		for _, op := range overrideHeaders {
+			applyOverrideOperationToHeaders(ctx, request.Headers, op, renderCtx)
+		}
+
+		return request, nil
+	})
+}

@@ -1,0 +1,93 @@
+package llm
+
+type RequestType string
+
+const (
+	RequestTypeChat       RequestType = "chat"
+	RequestTypeEmbedding  RequestType = "embedding"
+	RequestTypeRerank     RequestType = "rerank"
+	RequestTypeImage      RequestType = "image"
+	RequestTypeVideo      RequestType = "video"
+	RequestTypeCompact    RequestType = "compact"
+	RequestTypeCompletion RequestType = "completion"
+
+	// RequestTypeSpeech is the text-to-speech (TTS) request type, maps to /v1/audio/speech.
+	RequestTypeSpeech RequestType = "speech"
+	// RequestTypeTranscription is the speech-to-text (STT) request type, maps to /v1/audio/transcriptions.
+	RequestTypeTranscription RequestType = "transcription"
+	// RequestTypeTranslation is the speech-to-text translation request type, maps to /v1/audio/translations.
+	RequestTypeTranslation RequestType = "translation"
+	// RequestTypeModeration is the content moderation request type, maps to /v1/moderations.
+	RequestTypeModeration RequestType = "moderation"
+	// RequestTypeAlphaSearch is the Codex/CPA alpha search request type, maps to /v1/alpha/search.
+	RequestTypeAlphaSearch RequestType = "alpha_search"
+)
+
+func (r RequestType) String() string {
+	return string(r)
+}
+
+type APIFormat string
+
+const (
+	APIFormatOpenAIChatCompletion APIFormat = "openai/chat_completions"
+	APIFormatOpenAICompletion     APIFormat = "openai/completions"
+	APIFormatOpenAIResponse       APIFormat = "openai/responses"
+	// APIFormatOpenAIResponseWebSocket identifies a downstream Responses
+	// WebSocket request in persisted request/trace metadata. Upstream channel
+	// selection continues to use APIFormatOpenAIResponse with websocket transport.
+	APIFormatOpenAIResponseWebSocket APIFormat = "openai/responses-ws"
+	APIFormatOpenAIResponseCompact   APIFormat = "openai/responses_compact"
+	APIFormatOpenAIImageGeneration   APIFormat = "openai/image_generation"
+	APIFormatOpenAIImageEdit         APIFormat = "openai/image_edit"
+	APIFormatOpenAIImageVariation    APIFormat = "openai/image_variation"
+	APIFormatOpenAIEmbedding         APIFormat = "openai/embeddings"
+	APIFormatOpenAIVideo             APIFormat = "openai/video"
+
+	APIFormatOpenAISpeech        APIFormat = "openai/audio_speech"
+	APIFormatOpenAITranscription APIFormat = "openai/audio_transcriptions"
+	APIFormatOpenAITranslation   APIFormat = "openai/audio_translations"
+	APIFormatOpenAIModeration    APIFormat = "openai/moderations"
+	APIFormatOpenAIAlphaSearch   APIFormat = "openai/alpha_search"
+	APIFormatGeminiContents      APIFormat = "gemini/contents"
+	APIFormatAnthropicMessage    APIFormat = "anthropic/messages"
+	APIFormatAiSDKText           APIFormat = "aisdk/text"
+	APIFormatAiSDKDataStream     APIFormat = "aisdk/datastream"
+
+	APIFormatGeminiEmbedding APIFormat = "gemini/embeddings"
+
+	APIFormatJinaRerank    APIFormat = "jina/rerank"
+	APIFormatJinaEmbedding APIFormat = "jina/embeddings"
+
+	APIFormatOllamaChat    APIFormat = "ollama/chat"
+	APIFormatSeedanceVideo APIFormat = "seedance/video"
+	APIFormatZenmuxVideo   APIFormat = "zenmux/video"
+)
+
+func (f APIFormat) String() string {
+	return string(f)
+}
+
+const (
+	// ToolTypeFunction is the function grounding tool type for OpenAI.
+	ToolTypeFunction = "function"
+
+	// ToolTypeImageGeneration is the image generation grounding tool type for OpenAI.
+	ToolTypeImageGeneration = "image_generation"
+
+	// ToolTypeWebSearch is the web search grounding tool type.
+	ToolTypeWebSearch = "web_search"
+
+	// ToolTypeGoogleSearch is the Google Search grounding tool type for Gemini.
+	ToolTypeGoogleSearch = "google_search"
+
+	// ToolTypeGoogleCodeExecution is the code execution tool type for Gemini.
+	ToolTypeGoogleCodeExecution = "google_code_execution"
+
+	// ToolTypeGoogleUrlContext is the URL context grounding tool type for Gemini 2.0+.
+	ToolTypeGoogleUrlContext = "google_url_context"
+
+	// ToolTypeResponsesCustomTool is the custom tool type for OpenAI Responses API.
+	// Custom tools use freeform input (not JSON) and a grammar-based format definition.
+	ToolTypeResponsesCustomTool = "responses_custom_tool"
+)

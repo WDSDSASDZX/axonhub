@@ -1,0 +1,90 @@
+# schema tells gqlgen where the GraphQL schema is located.
+schema:
+  - openapi.graphql
+
+omit_gqlgen_version_in_file_notice: true
+
+#exec:
+#  layout: follow-schema
+#  dir: ./graph
+#  package: graph
+
+# resolver reports where the resolver implementations go.
+resolver:
+  layout: follow-schema
+  dir: .
+
+# gqlgen will search for any type names in the schema in these go packages
+# if they match it will use them, otherwise it will generate them.
+
+# autobind tells gqngen to search for any type names in the GraphQL schema in the
+# provided package. If they match it will use them, otherwise it will generate new.
+autobind:
+  - github.com/99designs/gqlgen/graphql/introspection
+
+# This section declares type mapping between the GraphQL and Go type systems.
+models:
+  # Defines the ID field as Go 'int'.
+  ID:
+    model:
+      - github.com/looplj/axonhub/internal/objects.GUID
+  Decimal:
+    model:
+      - github.com/looplj/axonhub/internal/objects.Decimal
+  DecimalInput:
+    model:
+      - github.com/looplj/axonhub/internal/objects.Decimal
+  ModelMapping:
+    model:
+      - github.com/looplj/axonhub/internal/objects.ModelMapping
+  ModelMappingInput:
+    model:
+      - github.com/looplj/axonhub/internal/objects.ModelMapping
+  ChannelTagsMatchMode:
+    model:
+      - github.com/looplj/axonhub/internal/objects.ChannelTagsMatchMode
+  UpdateAPIKeyProfilesInput:
+    model:
+      - github.com/looplj/axonhub/internal/objects.APIKeyProfiles
+  APIKeyProfiles:
+    model:
+      - github.com/looplj/axonhub/internal/objects.APIKeyProfiles
+  APIKeyProfile:
+    model:
+      - github.com/looplj/axonhub/internal/objects.APIKeyProfile
+  APIKeyProfileInput:
+    model:
+      - github.com/looplj/axonhub/internal/objects.APIKeyProfile
+  APIKeyQuota:
+    model:
+      - github.com/looplj/axonhub/internal/objects.APIKeyQuota
+  APIKeyQuotaInput:
+    model:
+      - github.com/looplj/axonhub/internal/objects.APIKeyQuota
+  APIKeyQuotaPeriod:
+    model:
+      - github.com/looplj/axonhub/internal/objects.APIKeyQuotaPeriod
+  APIKeyQuotaPeriodInput:
+    model:
+      - github.com/looplj/axonhub/internal/objects.APIKeyQuotaPeriod
+  APIKeyQuotaPeriodType:
+    model:
+      - github.com/looplj/axonhub/internal/objects.APIKeyQuotaPeriodType
+  APIKeyQuotaPastDuration:
+    model:
+      - github.com/looplj/axonhub/internal/objects.APIKeyQuotaPastDuration
+  APIKeyQuotaPastDurationInput:
+    model:
+      - github.com/looplj/axonhub/internal/objects.APIKeyQuotaPastDuration
+  APIKeyQuotaPastDurationUnit:
+    model:
+      - github.com/looplj/axonhub/internal/objects.APIKeyQuotaPastDurationUnit
+  APIKeyQuotaCalendarDuration:
+    model:
+      - github.com/looplj/axonhub/internal/objects.APIKeyQuotaCalendarDuration
+  APIKeyQuotaCalendarDurationInput:
+    model:
+      - github.com/looplj/axonhub/internal/objects.APIKeyQuotaCalendarDuration
+  APIKeyQuotaCalendarDurationUnit:
+    model:
+      - github.com/looplj/axonhub/internal/objects.APIKeyQuotaCalendarDurationUnit

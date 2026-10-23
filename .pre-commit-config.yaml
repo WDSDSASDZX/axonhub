@@ -1,0 +1,23 @@
+repos:
+  - repo: local
+    hooks:
+      - id: golangci-lint-all
+        name: golangci-lint (all modules)
+        entry: make lint-all
+        language: system
+        types: [go]
+        pass_filenames: false
+
+      - id: run-go-test
+        name: Run go test
+        entry: make test-backend-all
+        language: system
+        types: [go]
+        pass_filenames: false
+
+  - repo: https://github.com/dnephin/pre-commit-golang
+    rev: v0.5.1
+    hooks:
+      #      - id: go-build
+      - id: go-mod-tidy
+
