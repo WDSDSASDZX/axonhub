@@ -1,0 +1,36 @@
+name: Personal edition
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  worker-and-gateway:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: PYTHONPATH=personal python3 -m unittest discover -s personal/tests -v
+      - run: go test -tags=nomsgpack ./internal/personal ./internal/server ./internal/server/orchestrator ./internal/server/api ./internal/server/middleware
+      - run: cd llm && go test ./oauth
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+      - run: cd frontend && pnpm install --frozen-lockfile
+      - run: cd frontend && pnpm build
+      - run: cd frontend && pnpm exec eslint src/features/personal src/routes/_authenticated/hub src/routes/_authenticated/dashboard/index.tsx

@@ -1,8 +1,8 @@
-# AxonHub
+# AxonHub Personal
 
-我自己在用的一个 AI 网关。起因很简单：手上的项目一会儿用 OpenAI 的 SDK，一会儿用 Anthropic 的 SDK，供应商一多，key 管理、格式转换、成本统计就全乱套了。所以写了这个东西，把所有供应商收拢到一个入口，对外只暴露 OpenAI / Anthropic 兼容的接口，请求进来之后由它做转换和路由。
+基于 [AxonHub](https://github.com/looplj/axonhub) 改造的个人模型网关。保留 Go 在线转发核心，精简团队管理流程，整合 DSH Jet Hub 的多账号、静默续期、额度、签到、模型开关和跨渠道聚合功能，并由 Python 后台发布直接渠道的临期额度策略。
 
-现在它是我日常开发环境的一部分，基本每天都在跑。
+个人版安装、运行方式、与原版的差异和当前限制见 [个人版说明](docs/personal-edition.md)。平台适配器由已安装的 Jet Hub 插件执行；本项目并未把整个插件重写成 Python。以下保留原有网关能力说明。
 
 ## 它到底干什么
 
