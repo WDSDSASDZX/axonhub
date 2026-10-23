@@ -7,6 +7,7 @@ from axonhub.admin import router as admin_router
 from axonhub.config import Settings
 from axonhub.db import Database
 from axonhub.gateway import router as gateway_router
+from axonhub.routing import ChannelRouter
 
 
 def create_app(
@@ -34,6 +35,10 @@ def create_app(
 
     application = FastAPI(title="AxonHub Python", version="0.1.0", lifespan=lifespan)
     application.state.settings = settings or Settings()
+    application.state.router = ChannelRouter(
+        application.state.settings.failure_threshold,
+        application.state.settings.cooldown_seconds,
+    )
     application.include_router(admin_router)
     application.include_router(gateway_router)
 

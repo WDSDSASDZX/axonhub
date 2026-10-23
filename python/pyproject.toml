@@ -5,6 +5,7 @@ description = "A small asynchronous AI gateway inspired by AxonHub"
 requires-python = ">=3.12"
 dependencies = [
   "aiosqlite>=0.20,<1",
+  "anyio>=4,<5",
   "cryptography>=44",
   "fastapi>=0.115,<1",
   "httpx>=0.28,<1",

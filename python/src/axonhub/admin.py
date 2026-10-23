@@ -1,10 +1,10 @@
 import secrets
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field, SecretStr, field_validator
-from sqlalchemy import select
+from sqlalchemy import func, select, update
 
-from axonhub.db import Channel, ClientKey
+from axonhub.db import Channel, ClientKey, RequestLog
 from axonhub.security import cipher, digest_key, require_admin
 
 router = APIRouter(prefix="/admin", dependencies=[Depends(require_admin)])
@@ -127,3 +127,52 @@ async def revoke_key(key_id: int, request: Request):
             raise HTTPException(404, "Client key not found")
         key.enabled = False
         await session.commit()
+
+
+@router.post("/channels/{channel_id}/reset-budget", status_code=204)
+async def reset_budget(channel_id: int, request: Request):
+    async with request.app.state.database.sessions() as session:
+        result = await session.execute(
+            update(Channel).where(Channel.id == channel_id).values(requests_sent=0)
+        )
+        await session.commit()
+        if result.rowcount == 0:
+            raise HTTPException(404, "Channel not found")
+
+
+@router.get("/requests")
+async def requests(
+    request: Request,
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    status: str | None = None,
+    model: str | None = None,
+):
+    query = select(RequestLog)
+    if status:
+        query = query.where(RequestLog.status == status)
+    if model:
+        query = query.where(RequestLog.model == model)
+    async with request.app.state.database.sessions() as session:
+        total = await session.scalar(select(func.count()).select_from(query.subquery()))
+        rows = await session.scalars(
+            query.order_by(RequestLog.created_at.desc()).limit(limit).offset(offset)
+        )
+        return {
+            "total": total,
+            "items": [
+                {
+                    "id": row.id,
+                    "created_at": row.created_at.isoformat(),
+                    "model": row.model,
+                    "channel_id": row.channel_id,
+                    "status": row.status,
+                    "http_status": row.http_status,
+                    "duration_ms": round(row.duration_ms, 2),
+                    "ttft_ms": row.ttft_ms,
+                    "usage": row.usage,
+                    "attempts": row.attempts,
+                }
+                for row in rows
+            ],
+        }
