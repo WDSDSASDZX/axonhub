@@ -1,21 +1,59 @@
 package orchestrator
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"slices"
 	"time"
 
 	"github.com/looplj/axonhub/internal/personal"
+	"github.com/looplj/axonhub/llm"
 )
 
 var personalPolicyCache personal.Cache
 
-func applyPersonalPolicy(candidates []*ChannelModelsCandidate, requestedModel string) ([]*ChannelModelsCandidate, error) {
-	path := os.Getenv("AXONHUB_PERSONAL_POLICY_FILE")
-	if path == "" {
-		path = "data/personal/policy.json"
+type personalPolicyContextKey struct{}
+
+func personalPolicyActive(ctx context.Context) bool {
+	active, _ := ctx.Value(personalPolicyContextKey{}).(bool)
+	return active
+}
+
+func personalPolicyPath() string {
+	if path := os.Getenv("AXONHUB_PERSONAL_POLICY_FILE"); path != "" {
+		return path
 	}
+	return "data/personal/policy.json"
+}
+
+func personalPolicyManages(candidates []*ChannelModelsCandidate) bool {
+	p, err := personalPolicyCache.Load(personalPolicyPath(), time.Now())
+	if err != nil || p == nil {
+		return false
+	}
+	for _, rule := range p.Rules {
+		for _, candidate := range candidates {
+			if rule.ChannelID == candidate.Channel.ID {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+type personalPolicySelector struct{ wrapped CandidateSelector }
+
+func (s *personalPolicySelector) Select(ctx context.Context, req *llm.Request) ([]*ChannelModelsCandidate, error) {
+	candidates, err := s.wrapped.Select(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	return applyPersonalPolicy(candidates, req.Model)
+}
+
+func applyPersonalPolicy(candidates []*ChannelModelsCandidate, requestedModel string) ([]*ChannelModelsCandidate, error) {
+	path := personalPolicyPath()
 	now := time.Now()
 	policy, err := personalPolicyCache.Load(path, now)
 	if err != nil {
@@ -54,6 +92,9 @@ func applyPersonalPolicy(candidates []*ChannelModelsCandidate, requestedModel st
 	result := make([]*ChannelModelsCandidate, 0, len(accepted))
 	for _, a := range accepted {
 		result = append(result, a.candidate)
+	}
+	if len(candidates) > 0 && len(result) == 0 {
+		return nil, NewQuotaExhaustedError(requestedModel)
 	}
 	return result, nil
 }

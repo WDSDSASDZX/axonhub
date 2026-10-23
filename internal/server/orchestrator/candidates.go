@@ -720,6 +720,9 @@ func (s *LoadBalancedSelector) Select(ctx context.Context, req *llm.Request) ([]
 	if err != nil {
 		return nil, err
 	}
+	if personalPolicyManages(candidates) {
+		ctx = context.WithValue(ctx, personalPolicyContextKey{}, true)
+	}
 
 	// Get retry policy to determine the required number of candidates
 	retryPolicy := s.policy.RetryPolicyOrDefault(ctx)
@@ -750,7 +753,7 @@ func (s *LoadBalancedSelector) Select(ctx context.Context, req *llm.Request) ([]
 		requiredCount = 1 + retryPolicy.MaxChannelRetries
 	}
 
-	if traceStickyMode == biz.TraceStickyPreferPreviousChannel {
+	if traceStickyMode == biz.TraceStickyPreferPreviousChannel && !personalPolicyActive(ctx) {
 		if stickyCandidate, remainingCandidates := s.selectTraceStickyCandidate(ctx, candidates); stickyCandidate != nil {
 			stickyCandidate.TraceSticky = true
 
@@ -896,10 +899,28 @@ func (s *LoadBalancedSelector) sortCandidates(
 		var sortedCandidates []*ChannelModelsCandidate
 		if loadBalancer == nil {
 			sortedCandidates = group
-		} else if trackSelection {
+		} else if trackSelection && !personalPolicyActive(ctx) {
 			sortedCandidates = loadBalancer.Sort(ctx, group, req.Model, useStream)
 		} else {
 			sortedCandidates = loadBalancer.SortWithoutTracking(ctx, group, req.Model, useStream)
+		}
+		if personalPolicyActive(ctx) {
+			var err error
+			sortedCandidates, err = applyPersonalPolicy(sortedCandidates, req.Model)
+			if err != nil {
+				return nil
+			}
+			if loadBalancer != nil && loadBalancer.roundRobinHealthFilter != nil {
+				var healthy, unhealthy []*ChannelModelsCandidate
+				for _, candidate := range sortedCandidates {
+					if loadBalancer.roundRobinHealthFilter.IsUnhealthy(ctx, candidate.Channel) {
+						unhealthy = append(unhealthy, candidate)
+					} else {
+						healthy = append(healthy, candidate)
+					}
+				}
+				sortedCandidates = append(healthy, unhealthy...)
+			}
 		}
 
 		// Add candidates, but stop if we have enough
@@ -916,6 +937,9 @@ func (s *LoadBalancedSelector) sortCandidates(
 		}
 	}
 
+	if personalPolicyActive(ctx) && trackSelection && loadBalancer != nil && len(result) > 0 {
+		loadBalancer.TrackSelection(result[0])
+	}
 	if log.DebugEnabled(ctx) {
 		log.Debug(ctx, "Load balanced candidates for model",
 			log.String("model", req.Model),

@@ -39,3 +39,14 @@ func TestPersonalOwnerRejectsUnauthenticatedCalls(t *testing.T) {
 		t.Fatal(w.Code)
 	}
 }
+
+func TestPersonalRoutesCoexistWithGlobalOptions(t *testing.T) {
+	r := gin.New()
+	r.OPTIONS("/*any", func(c *gin.Context) { c.Status(204) })
+	registerPersonalRoutes(r.Group("/admin"), nil, nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("GET", "/admin/personal/status", nil))
+	if w.Code != 403 {
+		t.Fatal(w.Code)
+	}
+}

@@ -9,6 +9,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -24,6 +25,13 @@ import (
 )
 
 func personalMode() bool { return os.Getenv("AXONHUB_PERSONAL_MODE") != "false" }
+
+var personalWorkerTransport = &http.Transport{
+	ResponseHeaderTimeout: 50 * time.Second,
+	IdleConnTimeout:       30 * time.Second,
+	MaxIdleConns:          4,
+	MaxIdleConnsPerHost:   2,
+}
 
 func personalOwner() gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -63,8 +71,8 @@ func personalToken() (string, error) {
 	}
 	return token, nil
 }
-func registerPersonalRoutes(group *gin.RouterGroup, channels *biz.ChannelService) {
-	group.Any("/personal/*path", personalOwner(), func(c *gin.Context) {
+func registerPersonalRoutes(group *gin.RouterGroup, channels *biz.ChannelService, dbClient *ent.Client) {
+	handler := func(c *gin.Context) {
 		target, err := personalTarget()
 		if err != nil {
 			c.JSON(503, gin.H{"error": "个人版后台地址无效"})
@@ -75,9 +83,9 @@ func registerPersonalRoutes(group *gin.RouterGroup, channels *biz.ChannelService
 			c.JSON(503, gin.H{"error": "个人版后台未启动，请运行 personal worker"})
 			return
 		}
-		path := c.Param("path")
+		path := "/" + c.Param("action")
 		if path == "/connect" && c.Request.Method == http.MethodPost {
-			connectJetHub(c, channels, target, token)
+			connectJetHub(c, channels, dbClient, target, token)
 			return
 		}
 		allowed := map[string]string{"/status": "GET", "/rpc": "POST", "/budgets": "POST"}
@@ -86,7 +94,7 @@ func registerPersonalRoutes(group *gin.RouterGroup, channels *biz.ChannelService
 			return
 		}
 		proxy := httputil.NewSingleHostReverseProxy(target)
-		proxy.Transport = &http.Transport{ResponseHeaderTimeout: 50 * time.Second}
+		proxy.Transport = personalWorkerTransport
 		proxy.Director = func(req *http.Request) {
 			req.URL.Scheme, req.URL.Host, req.URL.Path, req.URL.RawQuery = target.Scheme, target.Host, path, ""
 			req.Host = target.Host
@@ -101,9 +109,11 @@ func registerPersonalRoutes(group *gin.RouterGroup, channels *biz.ChannelService
 		}
 		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 1024*1024)
 		proxy.ServeHTTP(c.Writer, c.Request)
-	})
+	}
+	group.GET("/personal/:action", personalOwner(), handler)
+	group.POST("/personal/:action", personalOwner(), handler)
 }
-func connectJetHub(c *gin.Context, svc *biz.ChannelService, target *url.URL, token string) {
+func connectJetHub(c *gin.Context, svc *biz.ChannelService, dbClient *ent.Client, target *url.URL, token string) {
 	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodGet, target.String()+"/connection", nil)
 	if err != nil {
 		c.JSON(503, gin.H{"error": "后台连接失败"})
@@ -136,13 +146,39 @@ func connectJetHub(c *gin.Context, svc *biz.ChannelService, target *url.URL, tok
 		c.JSON(502, gin.H{"error": "Jet Hub 必须运行在本机"})
 		return
 	}
+	autoSync := true
+	credentials := objects.ChannelCredentials{APIKey: data.APIKey}
+	existing, lookupErr := dbClient.Channel.Query().Where(channel.Name("Jet Hub")).Only(c.Request.Context())
+	if lookupErr == nil {
+		if !slices.Contains(existing.Tags, "jet-hub") {
+			c.JSON(409, gin.H{"error": "已有同名渠道，请先重命名以避免覆盖"})
+			return
+		}
+		updated, updateErr := svc.UpdateChannel(c.Request.Context(), existing.ID, &ent.UpdateChannelInput{
+			BaseURL: &data.BaseURL, Credentials: &credentials, SupportedModels: data.Models, AutoSyncSupportedModels: &autoSync,
+		})
+		if updateErr != nil {
+			c.JSON(500, gin.H{"error": "Jet Hub 渠道同步失败"})
+			return
+		}
+		c.JSON(200, gin.H{"id": updated.ID, "name": updated.Name, "models": len(data.Models)})
+		return
+	}
+	if !ent.IsNotFound(lookupErr) {
+		c.JSON(500, gin.H{"error": "渠道查询失败"})
+		return
+	}
 	created, err := svc.CreateChannel(c.Request.Context(), ent.CreateChannelInput{
 		Type: channel.TypeOpenai, Name: "Jet Hub", BaseURL: &data.BaseURL,
-		Credentials: objects.ChannelCredentials{APIKey: data.APIKey}, SupportedModels: data.Models,
+		Credentials: credentials, SupportedModels: data.Models, AutoSyncSupportedModels: &autoSync,
 		DefaultTestModel: data.Models[0], Tags: []string{"personal", "jet-hub"},
 	})
 	if err != nil {
 		c.JSON(409, gin.H{"error": "连接未创建，请检查是否已有 Jet Hub 渠道"})
+		return
+	}
+	if _, err = svc.UpdateChannelStatus(c.Request.Context(), created.ID, channel.StatusEnabled); err != nil {
+		c.JSON(500, gin.H{"error": "渠道已创建但未能启用，请在渠道页检查"})
 		return
 	}
 	c.JSON(201, gin.H{"id": created.ID, "name": created.Name, "models": len(data.Models)})
@@ -175,7 +211,7 @@ func personalGraphQLGuard() gin.HandlerFunc {
 		}
 		blocked := map[string]bool{
 			"createUser": true, "updateUserStatus": true, "deleteUser": true,
-			"createRole": true, "updateRole": true, "deleteRole": true,
+			"createRole": true, "updateRole": true, "deleteRole": true, "bulkDeleteRoles": true,
 			"createProject": true, "updateProject": true, "updateProjectStatus": true,
 			"deleteProject": true, "addUserToProject": true, "removeUserFromProject": true, "updateProjectUser": true,
 		}

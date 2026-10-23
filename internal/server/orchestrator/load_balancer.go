@@ -465,6 +465,10 @@ func (lb *LoadBalancer) prioritizeHealthyRoundRobinDecisions(ctx context.Context
 
 // calculateTopK determines how many candidates to select based on retry policy.
 func (lb *LoadBalancer) calculateTopK(ctx context.Context, candidates []*ChannelModelsCandidate) int {
+	// The background policy must rank the complete set after normal health filtering.
+	if personalPolicyActive(ctx) {
+		return len(candidates)
+	}
 	retryPolicy := lb.systemService.RetryPolicyOrDefault(ctx)
 
 	// Calculate topK based on retry policy

@@ -66,6 +66,7 @@ func selectCandidates(inbound *PersistentInboundTransformer, quotaProvider Provi
 
 		quotaSelector := WithProviderQuotaSelector(selector, quotaProvider, systemService)
 		selector = quotaSelector
+		selector = &personalPolicySelector{wrapped: selector}
 
 		if len(inbound.state.LoadBalancers) > 0 {
 			selector = WithRoutingPolicyLoadBalancedSelector(
@@ -79,10 +80,6 @@ func selectCandidates(inbound *PersistentInboundTransformer, quotaProvider Provi
 		}
 
 		candidates, err := selector.Select(ctx, llmRequest)
-		if err != nil {
-			return nil, err
-		}
-		candidates, err = applyPersonalPolicy(candidates, llmRequest.Model)
 		if err != nil {
 			return nil, err
 		}

@@ -107,6 +107,9 @@ func SetupRoutes(server *Server, handlers Handlers, client *ent.Client, services
 	}
 
 	adminGroup := server.Group("/admin", middleware.WithJWTAuth(services.AuthService), middleware.WithProjectID())
+	if personalMode() {
+		adminGroup.Use(personalOwner())
+	}
 	// 管理员路由 - 使用 JWT 认证
 	{
 		adminGroup.GET("/playground", middleware.WithTimeout(server.Config.RequestTimeout), func(c *gin.Context) {
@@ -118,7 +121,7 @@ func SetupRoutes(server *Server, handlers Handlers, client *ent.Client, services
 		if !personalMode() {
 			adminGroup.POST("/invitations", handlers.Invitation.Create)
 		}
-		registerPersonalRoutes(adminGroup, services.ChannelService)
+		registerPersonalRoutes(adminGroup, services.ChannelService, client)
 
 		adminGroup.POST("/codex/oauth/start", handlers.Codex.StartOAuth)
 		adminGroup.POST("/codex/oauth/exchange", handlers.Codex.Exchange)
