@@ -70,7 +70,10 @@ def public_channel(channel: Channel) -> dict:
 async def channels(request: Request):
     async with request.app.state.database.sessions() as session:
         rows = await session.scalars(select(Channel).order_by(Channel.id))
-        return [public_channel(row) for row in rows]
+        return [
+            {**public_channel(row), "cooling": request.app.state.router.cooling(row.id)}
+            for row in rows
+        ]
 
 
 @router.post("/channels", status_code=201)

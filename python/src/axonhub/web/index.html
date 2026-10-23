@@ -1,0 +1,308 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AxonHub · Python 网关</title>
+    <link rel="stylesheet" href="/assets/style.css" />
+    <script src="/assets/app.js" defer></script>
+  </head>
+  <body>
+    <section id="login" class="login-wrap">
+      <form id="login-form" class="login-card">
+        <div class="brand-mark">A</div>
+        <span class="eyebrow">AXONHUB / PYTHON</span>
+        <h1>管理你的模型入口</h1>
+        <p>连接渠道、分配密钥，查看每一次调用。</p>
+        <label for="admin-token">管理员凭证</label>
+        <input
+          id="admin-token"
+          type="password"
+          required
+          autocomplete="off"
+          placeholder="输入 .env 中的 AXON_ADMIN_TOKEN"
+        />
+        <button type="submit" class="primary">进入控制台 <span>→</span></button>
+        <p class="hint">
+          首次使用：在 python 目录运行 uv run axonhub
+          init。凭证仅保留在当前页面内存中。
+        </p>
+        <p id="login-error" class="error" role="alert"></p>
+      </form>
+    </section>
+    <div id="console" class="shell" hidden>
+      <aside>
+        <div class="brand">
+          <span class="brand-mark">A</span>
+          <div>AxonHub<small>PYTHON GATEWAY</small></div>
+        </div>
+        <div class="nav-label">工作空间</div>
+        <nav aria-label="主导航">
+          <button data-page="channels" class="nav active">
+            ◈ <span>渠道管理</span>
+          </button>
+          <button data-page="keys" class="nav">⌘ <span>API 密钥</span></button>
+          <button data-page="requests" class="nav">
+            ≋ <span>请求记录</span>
+          </button>
+        </nav>
+        <div class="aside-bottom">
+          <span class="status-dot"></span> 本地控制台<button id="logout">
+            退出
+          </button>
+        </div>
+      </aside>
+      <main>
+        <header>
+          <span class="breadcrumb"
+            >工作空间 / <span id="breadcrumb">渠道管理</span></span
+          ><span class="version">Python · v0.1</span>
+        </header>
+        <div id="notice" role="status" hidden></div>
+        <section id="page-channels" class="page">
+          <div class="page-heading">
+            <div>
+              <span class="eyebrow">CONNECTIONS</span>
+              <h1>渠道管理</h1>
+              <p>把不同供应商连接到同一个入口。</p>
+            </div>
+            <button class="primary" id="add-channel">＋ 添加渠道</button>
+          </div>
+          <div class="summary-grid">
+            <article>
+              <span>已配置渠道</span><strong id="channel-count">—</strong
+              ><small>统一模型入口</small>
+            </article>
+            <article>
+              <span>已启用</span><strong id="enabled-count">—</strong
+              ><small>参与渠道调度</small>
+            </article>
+            <article>
+              <span>已派发请求</span><strong id="dispatch-count">—</strong
+              ><small>包含失败尝试，重置后重新计数</small>
+            </article>
+          </div>
+          <div class="panel">
+            <div class="panel-heading">
+              <h2>供应商连接</h2>
+              <button class="quiet refresh">刷新</button>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>渠道</th>
+                    <th>模型映射</th>
+                    <th>权重</th>
+                    <th>已派发 / 预算</th>
+                    <th>状态</th>
+                    <th>操作</th>
+                  </tr>
+                </thead>
+                <tbody id="channel-rows"></tbody>
+              </table>
+            </div>
+            <div id="channels-empty" class="empty" hidden>
+              <b>从第一个渠道开始</b>
+              <p>添加供应商地址与密钥，即可通过统一接口调用。</p>
+            </div>
+          </div>
+          <p class="footnote">
+            预算为本地请求尝试次数上限，包含失败调用。未知的供应商额度不会被当成零。
+          </p>
+        </section>
+        <section id="page-keys" class="page" hidden>
+          <div class="page-heading">
+            <div>
+              <span class="eyebrow">ACCESS</span>
+              <h1>API 密钥</h1>
+              <p>给每个客户端分配独立凭证，随时撤销访问。</p>
+            </div>
+            <button class="primary" id="add-key">＋ 创建密钥</button>
+          </div>
+          <div id="new-key" class="secret-panel" hidden>
+            <strong>密钥已创建，仅显示这一次</strong>
+            <p>请复制后妥善保存。关闭后无法再次查看完整密钥。</p>
+            <div>
+              <input
+                id="created-key"
+                type="password"
+                readonly
+                aria-label="新建的 API 密钥"
+              /><button id="copy-key">复制</button
+              ><button id="dismiss-key" class="quiet">关闭</button>
+            </div>
+          </div>
+          <div class="panel">
+            <div class="panel-heading">
+              <h2>客户端密钥</h2>
+              <button class="quiet refresh">刷新</button>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>名称</th>
+                    <th>密钥前缀</th>
+                    <th>状态</th>
+                    <th>操作</th>
+                  </tr>
+                </thead>
+                <tbody id="key-rows"></tbody>
+              </table>
+            </div>
+            <div id="keys-empty" class="empty" hidden>
+              <b>还没有客户端密钥</b>
+              <p>创建一个密钥，再将客户端地址指向此网关。</p>
+            </div>
+          </div>
+        </section>
+        <section id="page-requests" class="page" hidden>
+          <div class="page-heading">
+            <div>
+              <span class="eyebrow">OBSERVABILITY</span>
+              <h1>请求记录</h1>
+              <p>查看响应状态、耗时和每一次渠道选择。</p>
+            </div>
+            <button class="quiet refresh">刷新记录</button>
+          </div>
+          <div class="panel">
+            <div class="panel-heading filters">
+              <h2>最近的调用</h2>
+              <select id="status-filter" aria-label="筛选请求状态">
+                <option value="">全部状态</option>
+                <option value="success">成功</option>
+                <option value="failed">失败</option>
+                <option value="disconnected">客户端断开</option>
+              </select>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>时间 / 请求 ID</th>
+                    <th>模型</th>
+                    <th>状态</th>
+                    <th>总耗时</th>
+                    <th>首段输出</th>
+                    <th>输入 / 输出 Token</th>
+                    <th>尝试</th>
+                  </tr>
+                </thead>
+                <tbody id="request-rows"></tbody>
+              </table>
+            </div>
+            <div id="requests-empty" class="empty" hidden>
+              <b>暂无调用记录</b>
+              <p>使用客户端 API 密钥发起一次请求，记录就会出现在这里。</p>
+            </div>
+            <div class="pagination">
+              <span id="request-total">0 条记录</span>
+              <div>
+                <button id="previous" class="quiet">上一页</button
+                ><button id="next" class="quiet">下一页</button>
+              </div>
+            </div>
+          </div>
+          <p class="footnote">
+            首段输出仅统计流式请求的首个非空内容或工具调用。未返回的用量显示为「—」。
+          </p>
+        </section>
+      </main>
+    </div>
+    <dialog id="channel-dialog">
+      <form id="channel-form">
+        <div class="dialog-heading">
+          <h2>添加渠道</h2>
+          <button type="button" class="quiet close-dialog" aria-label="关闭">
+            ×
+          </button>
+        </div>
+        <label
+          >渠道名称<input
+            name="name"
+            required
+            maxlength="80"
+            placeholder="例如：主渠道" /></label
+        ><label
+          >API 基础地址<input
+            name="base_url"
+            type="url"
+            required
+            placeholder="https://provider.example/v1" /></label
+        ><label
+          >供应商密钥<input
+            name="api_key"
+            type="password"
+            required
+            autocomplete="off"
+        /></label>
+        <div class="form-grid">
+          <label
+            >对外模型名<input
+              name="alias"
+              required
+              placeholder="assistant" /></label
+          ><label
+            >供应商模型名<input
+              name="upstream_model"
+              required
+              placeholder="实际模型 ID"
+          /></label>
+        </div>
+        <div class="form-grid">
+          <label
+            >调度权重<input
+              name="weight"
+              type="number"
+              min="1"
+              max="100"
+              value="1"
+              required /></label
+          ><label
+            >请求次数预算<input
+              name="request_budget"
+              type="number"
+              min="0"
+              placeholder="留空表示不限"
+          /></label>
+        </div>
+        <p class="hint">
+          基础地址应包含供应商要求的路径前缀，例如
+          /v1。密钥会加密保存在本地数据库。
+        </p>
+        <p class="error form-error" role="alert"></p>
+        <button class="primary" type="submit">保存渠道</button>
+      </form>
+    </dialog>
+    <dialog id="key-dialog">
+      <form id="key-form">
+        <div class="dialog-heading">
+          <h2>创建 API 密钥</h2>
+          <button type="button" class="quiet close-dialog" aria-label="关闭">
+            ×
+          </button>
+        </div>
+        <label
+          >密钥名称<input
+            name="name"
+            required
+            maxlength="80"
+            placeholder="例如：本地开发"
+        /></label>
+        <p class="hint">用于客户端访问网关，与供应商密钥相互独立。</p>
+        <p class="error form-error" role="alert"></p>
+        <button class="primary" type="submit">创建</button>
+      </form>
+    </dialog>
+    <dialog id="trace-dialog">
+      <div class="dialog-heading">
+        <h2>请求详情</h2>
+        <button type="button" class="quiet close-dialog" aria-label="关闭">
+          ×
+        </button>
+      </div>
+      <pre id="trace-content"></pre>
+    </dialog>
+  </body>
+</html>

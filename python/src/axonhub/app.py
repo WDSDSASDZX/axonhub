@@ -1,7 +1,10 @@
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import httpx
 from fastapi import FastAPI
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from axonhub.admin import router as admin_router
 from axonhub.config import Settings
@@ -41,6 +44,20 @@ def create_app(
     )
     application.include_router(admin_router)
     application.include_router(gateway_router)
+    web = Path(__file__).with_name("web")
+    application.mount("/assets", StaticFiles(directory=web), name="assets")
+
+    @application.get("/", include_in_schema=False)
+    async def console():
+        return FileResponse(
+            web / "index.html",
+            headers={
+                "Content-Security-Policy": (
+                    "default-src 'self'; frame-ancestors 'none'; base-uri 'none'"
+                ),
+                "Cache-Control": "no-store",
+            },
+        )
 
     @application.get("/health")
     async def health() -> dict[str, str]:
