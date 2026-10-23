@@ -1,60 +1,15 @@
-FROM --platform=$BUILDPLATFORM node:22-alpine AS frontend-builder
-
-WORKDIR /build
-RUN corepack enable && corepack prepare pnpm@10 --activate
-COPY frontend/package.json frontend/pnpm-lock.yaml ./
-RUN --mount=type=cache,target=/root/.local/share/pnpm/store \
-    pnpm install --frozen-lockfile
-
-COPY ./frontend .
-ENV NODE_OPTIONS="--max-old-space-size=4096"
-RUN pnpm build
-
-# Copy dist to a stage with the target platform to avoid architecture mismatch
-FROM alpine AS frontend-dist
-COPY --from=frontend-builder /build/dist /dist
-
-FROM golang:alpine AS backend-builder
-
-WORKDIR /build
-
-RUN apk add --no-cache git ca-certificates tzdata
-
-COPY go.mod go.sum ./
-COPY llm/go.mod llm/go.sum llm/
-RUN --mount=type=cache,target=/go/pkg/mod \
-    --mount=type=cache,target=/root/.cache/go-build \
-    GOTOOLCHAIN=auto go mod download
-
-COPY . .
-COPY --from=frontend-dist /dist /build/internal/server/static/dist
-
-ENV GO111MODULE=on \
-    CGO_ENABLED=0 \
-    GOOS=linux
-
-RUN --mount=type=cache,target=/go/pkg/mod \
-    --mount=type=cache,target=/root/.cache/go-build \
-    GOTOOLCHAIN=auto go build \
-    -tags=nomsgpack \
-    -ldflags "-s -w -X 'github.com/looplj/axonhub/internal/build.Version=$(cat internal/build/VERSION 2>/dev/null || echo dev)' -X 'github.com/looplj/axonhub/internal/build.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)'" \
-    -o axonhub \
-    ./cmd/axonhub && \
-    ./scripts/verify-go-sse-dependency-test.sh && \
-    ./scripts/verify-go-sse-dependency.sh ./axonhub
-
-FROM alpine
-
-RUN apk add --no-cache ca-certificates tzdata
-RUN addgroup -S -g 65532 axonhub \
-    && adduser -S -D -H -u 65532 -G axonhub axonhub
+FROM python:3.12-slim
 
 WORKDIR /app
-COPY --from=backend-builder --chown=axonhub:axonhub /build/axonhub /app/axonhub
+RUN pip install --no-cache-dir uv==0.12.10 \
+    && useradd --create-home --uid 10001 gateway
+COPY pyproject.toml uv.lock ./
+COPY src ./src
+RUN uv sync --locked --no-dev \
+    && mkdir data && chown gateway:gateway data
 
-# Keep root as the image default for backward compatibility with SQLite data
-# directories created by older images. Deployments that have prepared writable
-# volumes can still opt in to the unprivileged 65532:65532 user.
-
-EXPOSE 8090
-ENTRYPOINT ["/app/axonhub"]
+USER gateway
+EXPOSE 8091
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8091/health', timeout=3)"
+CMD ["/app/.venv/bin/axonhub", "--host", "0.0.0.0"]

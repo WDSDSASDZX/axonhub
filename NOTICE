@@ -1,0 +1,8 @@
+AxonHub Python
+
+This project is a focused Python implementation based on the use cases and design of AxonHub.
+Original project: https://github.com/looplj/axonhub
+Original AxonHub copyright: 2026 looplj
+
+The earlier Go code and its directory-specific license notices remain available at the
+go-baseline tag in this repository. The current Python implementation uses Apache-2.0.

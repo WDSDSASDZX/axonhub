@@ -1,185 +1,39 @@
-# Covers JetBrains IDEs: IntelliJ, RubyMine, PhpStorm, AppCode, PyCharm, CLion
-
-
-# Ignore all
-*
-
-# Unignore all with extensions
-!*.*
-!Makefile
-!LICENSE
-!Dockerfile
-!VERSION
-
-
-# Unignore all dirs
-!*/
-
-### Above combination will ignore all files without extension ###
-
-*.iml
-
-## Directory-based project format:
-.idea/
-# if you remove the above rule, at least ignore the following:
-
-# User-specific stuff:
-# .idea/workspace.xml
-# .idea/tasks.xml
-# .idea/dictionaries
-
-# Sensitive or high-churn files:
-# .idea/dataSources.ids
-# .idea/dataSources.xml
-# .idea/sqlDataSources.xml
-# .idea/dynamic.xml
-# .idea/uiDesigner.xml
-
-# Gradle:
-# .idea/gradle.xml
-# .idea/libraries
-
-# Mongo Explorer plugin:
-# .idea/mongoSettings.xml
-
-## File-based project format:
-*.ipr
-*.iws
-
-## Plugin-specific files:
-
-# IntelliJ
-/out/
-*target*
-
-# mpeltonen/sbt-idea plugin
-.idea_modules/
-
-# JIRA plugin
-atlassian-ide-plugin.xml
-
-# Crashlytics plugin (for Android Studio and IntelliJ)
-com_crashlytics_export_strings.xml
-crashlytics.properties
-crashlytics-build.properties
-
-# MAC
-.DS_Store
-
-# custom
-tmp/
-*_server
-*_cmd
-*.log
-
-.fuse_hidden*
-*.csv
-*.sqlite
-*.db
-*-journal
-
-*.code-workspace
-
-# Added by Task Master AI
-# Logs
-logs
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-dev-debug.log
-# Dependency directories
-node_modules/
-# Lock files - project uses pnpm
-package-lock.json
-bun.lock
-# Environment variables
+# Local credentials and runtime data
 .env
-# Editor directories and files
-.idea
-.vscode
-*.suo
-*.ntvs*
-*.njsproj
-*.sln
-*.sw?
-# OS specific
-
-# Task files
-# tasks.json
-# tasks/ 
-
-.kiro
-openspec
-.cursor
-.vercel
-.tanstack
-.trae/tasks
-.trae/summary
-.trae/documents
-playwright-report/
-test-results
-.claude
-.qoder
-.codebuddy
-dumps
-.builds
-.pnpm-store
-.serena
-.claude
-.gomodcache
-.gocache
-
-config.yml
-internal/server/static/dist/*
-!internal/server/static/dist/.gitkeep
-*.b64
-coverage.out
-*.test
-*.backup
-
-.playwright-cli/
-
-# E2E testing artifacts
-scripts/e2e/.e2e-backend.pid
-scripts/e2e/axonhub-e2e.db
-scripts/e2e/e2e-backend.log
-scripts/e2e/axonhub-e2e
-scripts/e2e/.e2e-backend-db-type
-scripts/migration/migration-test/
-# Migration testing artifacts
-scripts/migration/migration-test/
-tools
-
-mise.toml
-locales_backup
-.sisyphus
-
-# Chunkhound local database
-.chunkhound/
-.superset/
-.snow/
-config.schema.json
+.env.*
+!.env.example
+data/
+*.db
 *.db-shm
 *.db-wal
-*.agent/summary
-.factory
-.omo/
-.omc/
-.playwright-mcp/
-.ace-tool/
-.omx/
-deploy_dev.sh
-# local build caches
-.gocache/
-.gomodcache/
+*.sqlite
+*.log
 
-# Python gateway
-__pycache__/
+# Python
 .venv/
+__pycache__/
+*.py[cod]
 .pytest_cache/
 .ruff_cache/
-*.pyc
+.coverage
+htmlcov/
+dist/
+build/
 *.egg-info/
-python/data/
-python/.env
-python/dist/
+
+# Editors and browser artifacts
+.idea/
+.vscode/
+.DS_Store
+.playwright*/
+test-results/
+playwright-report/
+
+# Local artifacts retained from the Go workspace
+python/
+.gocache/
+.gomodcache/
+config.yml
+frontend/
+internal/
+llm/
