@@ -1,20 +1,22 @@
 import { useState, useCallback } from 'react';
+import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { Link } from '@tanstack/react-router';
 import { IconSettings } from '@tabler/icons-react';
-import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
-import { SidebarTrigger, useSidebar } from '@/components/ui/sidebar';
+import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
+import { SidebarTrigger, useSidebar } from '@/components/ui/sidebar';
 import { LanguageSwitch } from '@/components/language-switch';
-import { ThemeSwitch } from '@/components/theme-switch';
-import { QuotaBadges } from '@/components/quota-badges';
 import { PermissionGuard } from '@/components/permission-guard';
+import { QuotaBadges } from '@/components/quota-badges';
+import { ThemeSwitch } from '@/components/theme-switch';
+import { usePersonalProfile } from '@/features/personal/profile';
 import { checkProviderQuotas } from '@/features/system/data/quotas';
 import { useBrandSettings } from '@/features/system/data/system';
 import { ProjectSwitcher } from './project-switcher';
-import { toast } from 'sonner';
 
 export function AppHeader() {
+  const { data: profile } = usePersonalProfile();
   const { data: brandSettings } = useBrandSettings();
   const { t } = useTranslation();
   const [isRefreshing, setIsRefreshing] = useState(false);
@@ -75,7 +77,7 @@ export function AppHeader() {
           <div className='bg-border mx-0.5 h-3.5 w-px' />
 
           {/* Project Switcher */}
-          <ProjectSwitcher />
+          {profile?.personalMode === false && <ProjectSwitcher />}
         </div>
 
         {/* 右侧控件 */}

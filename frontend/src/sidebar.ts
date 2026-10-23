@@ -17,12 +17,14 @@ import {
 import { Command } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { useAuthStore } from '@/stores/authStore';
-import { useRoutePermissions } from '@/hooks/useRoutePermissions';
 import { formatUserName, isCJKName } from '@/lib/utils';
+import { useRoutePermissions } from '@/hooks/useRoutePermissions';
 import { useMe } from '@/features/auth/data/auth';
+import { usePersonalProfile, personalPaths } from '@/features/personal/profile';
 import { type SidebarData, type NavGroup, type NavLink } from './components/layout/types';
 
 export function useSidebarData(): SidebarData {
+  const { data: profile } = usePersonalProfile();
   const { t } = useTranslation();
   const { user: authUser } = useAuthStore((state) => state.auth);
   const { data: meData } = useMe();
@@ -68,7 +70,7 @@ export function useSidebarData(): SidebarData {
       items: [
         {
           title: t('sidebar.items.dashboard'),
-          url: '/',
+          url: profile?.personalMode !== false ? '/dashboard' : '/',
           icon: IconLayoutDashboard,
         } as NavLink,
         {
@@ -198,7 +200,13 @@ export function useSidebarData(): SidebarData {
   ];
 
   // 使用权限过滤导航组
-  const filteredNavGroups = filterNavGroups(rawNavGroups);
+  const personal = profile?.personalMode !== false;
+  const filteredNavGroups = filterNavGroups(rawNavGroups).map((group) => ({
+    ...group,
+    title: personal && group.title === t('sidebar.groups.project') ? '调用与记录' : group.title,
+    items: personal ? group.items.filter((item) => !('url' in item) || !personalPaths.has(item.url || '')) : group.items,
+  }));
+  if (user?.isOwner) filteredNavGroups[0]?.items.unshift({ title: '账号与额度', url: '/hub', icon: IconAi } as NavLink);
 
   return {
     user: {

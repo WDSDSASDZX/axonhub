@@ -1,0 +1,204 @@
+.personal-hub {
+  width: 100%;
+  max-width: 1300px;
+  margin: auto;
+  padding-bottom: 4rem;
+}
+.ph-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1.5rem;
+  margin: 1rem 0 1.5rem;
+}
+.ph-eyebrow {
+  font-size: 0.7rem;
+  letter-spacing: 0.15em;
+  color: var(--muted-foreground);
+}
+.ph-heading h1 {
+  font-size: 1.85rem;
+  font-weight: 650;
+  margin: 0.4rem 0;
+}
+.ph-heading p,
+.ph-card > p,
+.ph-section p {
+  color: var(--muted-foreground);
+  font-size: 0.88rem;
+  line-height: 1.7;
+}
+.ph-notice,
+.ph-message,
+.ph-error {
+  padding: 0.8rem 1rem;
+  border-radius: 0.7rem;
+  margin: 0.8rem 0;
+  font-size: 0.86rem;
+  background: var(--muted);
+}
+.ph-error {
+  color: #c34343;
+  border: 1px solid #c3434350;
+}
+.ph-message {
+  color: var(--foreground);
+}
+.ph-toolbar {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  align-items: center;
+  flex-wrap: wrap;
+  margin: 1.6rem 0;
+}
+.ph-toolbar nav {
+  display: flex;
+  background: var(--muted);
+  padding: 0.3rem;
+  border-radius: 0.7rem;
+  gap: 0.3rem;
+}
+.ph-toolbar nav button {
+  padding: 0.6rem 1rem;
+  border-radius: 0.5rem;
+  font-size: 0.9rem;
+}
+.ph-toolbar nav button.active {
+  background: var(--background);
+  box-shadow: 0 1px 5px #0001;
+}
+.ph-toolbar select,
+.ph-form input {
+  border: 1px solid var(--border);
+  border-radius: 0.45rem;
+  padding: 0.5rem 0.7rem;
+  background: var(--background);
+  color: var(--foreground);
+}
+.ph-card {
+  border: 1px solid var(--border);
+  border-radius: 1rem;
+  margin: 1rem 0;
+  padding: 1.5rem;
+  background: var(--card);
+}
+.ph-card h2 {
+  font-size: 1.05rem;
+  font-weight: 600;
+  margin-bottom: 0.4rem;
+}
+.ph-section {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.ph-actions {
+  display: flex;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+.ph-empty {
+  padding: 2.5rem 1rem;
+  text-align: center;
+  color: var(--muted-foreground);
+  font-size: 0.88rem;
+}
+.ph-account,
+.ph-model,
+.ph-policy {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+  border-top: 1px solid var(--border);
+  padding: 1.1rem 0;
+}
+.ph-account:first-child {
+  margin-top: 1rem;
+}
+.ph-account small,
+.ph-model small,
+.ph-policy small {
+  display: block;
+  color: var(--muted-foreground);
+  font-size: 0.76rem;
+  margin-top: 0.4rem;
+  overflow-wrap: anywhere;
+}
+.ph-good,
+.ph-muted {
+  display: inline-block;
+  font-size: 0.72rem;
+  padding: 0.2rem 0.55rem;
+  border-radius: 1rem;
+  margin: 0.4rem 0.5rem 0 0;
+  background: var(--muted);
+}
+.ph-good {
+  color: #16805b;
+  background: #16805b12;
+}
+.ph-model-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 0 1.5rem;
+  margin-top: 1rem;
+}
+.ph-model label {
+  white-space: nowrap;
+  font-size: 0.8rem;
+}
+.ph-model strong {
+  font-size: 0.88rem;
+}
+.ph-form {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 1rem;
+  margin-top: 1.5rem;
+}
+.ph-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  font-size: 0.8rem;
+}
+.ph-form .ph-check {
+  flex-direction: row;
+  align-items: center;
+}
+.ph-form button {
+  align-self: end;
+}
+.ph-reading {
+  border-top: 1px solid var(--border);
+  padding: 1rem 0;
+}
+.ph-reading > p {
+  font-size: 0.8rem;
+  color: var(--muted-foreground);
+}
+.ph-balance {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.65rem;
+  font-size: 0.8rem;
+  margin: 0.6rem 0;
+  overflow-wrap: anywhere;
+}
+@media (max-width: 700px) {
+  .ph-heading,
+  .ph-account {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+  .ph-card {
+    padding: 1rem;
+  }
+  .ph-toolbar nav button {
+    padding: 0.5rem 0.65rem;
+  }
+}

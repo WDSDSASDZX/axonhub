@@ -321,7 +321,7 @@
   "scopes.select.selectedCount": "已选择 {{count}} 个权限",
   "scopes.select.noResults": "未找到权限范围",
   "auth.brand.title": "统一 AI 网关",
-  "auth.brand.description": "统一兼容 OpenAI/Anthropic/Gemini 的 API，具备灵活的 Transformer 管道、智能路由与全链路追踪——为企业级可靠性而生。",
+  "auth.brand.description": "统一管理个人模型渠道、账号和额度，兼容 OpenAI/Anthropic/Gemini 接口，支持自动路由与请求追踪。",
   "auth.signIn.title": "登录到 AxonHub",
   "auth.signIn.subtitle": "输入您的邮箱和密码以访问您的账户",
   "auth.signIn.form.email.label": "邮箱",

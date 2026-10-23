@@ -1,5 +1,5 @@
 import Cookies from 'js-cookie';
-import { Outlet } from '@tanstack/react-router';
+import { Outlet, Navigate, useLocation } from '@tanstack/react-router';
 import { cn } from '@/lib/utils';
 import { useVersionCheck } from '@/hooks/use-version-check';
 import { SidebarProvider } from '@/components/ui/sidebar';
@@ -7,6 +7,7 @@ import { AppHeader } from '@/components/layout/app-header';
 import { AppSidebar } from '@/components/layout/app-sidebar';
 import SkipToMain from '@/components/skip-to-main';
 import { OnboardingProvider } from '@/features/onboarding';
+import { usePersonalProfile, personalPaths } from '@/features/personal/profile';
 import { useSidebarData } from './sidebar';
 
 interface Props {
@@ -19,6 +20,11 @@ export function AuthenticatedLayout({ children }: Props) {
 
   // Check for new version on mount (only for owners)
   useVersionCheck();
+  const { data: profile } = usePersonalProfile();
+  const { pathname } = useLocation();
+  if (profile?.personalMode !== false && [...personalPaths].some((path) => pathname === path || pathname.startsWith(path + '/'))) {
+    return <Navigate to='/' />;
+  }
 
   return (
     <SidebarProvider defaultOpen={defaultOpen} className='fixed inset-0 min-h-0 flex-col overflow-hidden'>
