@@ -6,13 +6,14 @@ from typing import Annotated
 import anyio
 import httpx
 from fastapi import APIRouter, Depends, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 
 from axonhub.db import Channel, ClientKey
 from axonhub.routing import reserve_attempt
 from axonhub.security import cipher, require_client
+from axonhub.streaming import GatewayStreamingResponse
 from axonhub.telemetry import RequestTrace
 
 router = APIRouter(prefix="/v1")
@@ -177,8 +178,10 @@ async def chat(body: ChatInput, request: Request, key: AuthenticatedKey):
             return failure
         if body.stream:
             handed_to_stream = True
-            return StreamingResponse(
+            return GatewayStreamingResponse(
                 stream_events(response, body.model, trace, request.app.state.router),
+                trace=trace,
+                upstream=response,
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
