@@ -172,3 +172,13 @@ deploy_dev.sh
 # local build caches
 .gocache/
 .gomodcache/
+
+# Python gateway
+__pycache__/
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.pyc
+*.egg-info/
+python/data/
+python/.env
