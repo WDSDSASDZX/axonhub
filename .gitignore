@@ -170,5 +170,15 @@ config.schema.json
 .omx/
 deploy_dev.sh
 # local build caches
+data/personal/
+.env.personal
+.env.*
+**/__pycache__/
+.venv/
+.pytest_cache/
+.ruff_cache/
+personal/__pycache__/
+personal/**/__pycache__/
+output/playwright/
 .gocache/
 .gomodcache/

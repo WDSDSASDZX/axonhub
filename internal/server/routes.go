@@ -43,10 +43,11 @@ type Handlers struct {
 type Services struct {
 	fx.In
 
-	TraceService  *biz.TraceService
-	ThreadService *biz.ThreadService
-	AuthService   *biz.AuthService
-	SystemService *biz.SystemService
+	TraceService   *biz.TraceService
+	ThreadService  *biz.ThreadService
+	AuthService    *biz.AuthService
+	SystemService  *biz.SystemService
+	ChannelService *biz.ChannelService
 }
 
 func SetupRoutes(server *Server, handlers Handlers, client *ent.Client, services Services, ipAccessControl *middleware.IPAccessControlConfig) {
@@ -82,14 +83,17 @@ func SetupRoutes(server *Server, handlers Handlers, client *ent.Client, services
 		publicGroup.GET("/favicon", handlers.System.GetFavicon)
 		// Health check endpoint - no authentication required
 		publicGroup.GET("/health", handlers.System.Health)
-		publicGroup.GET("/auth/invitations/:token", handlers.Invitation.Get)
-		publicGroup.POST("/auth/invitations/:token/register", handlers.Invitation.Register)
+		if !personalMode() {
+			publicGroup.GET("/auth/invitations/:token", handlers.Invitation.Get)
+			publicGroup.POST("/auth/invitations/:token/register", handlers.Invitation.Register)
+		}
 	}
 
 	unSecureAdminGroup := server.Group("/admin", middleware.WithTimeout(server.Config.RequestTimeout))
 	{
 		// System Status and Initialize - DO NOT AUTH
 		unSecureAdminGroup.GET("/system/status", handlers.System.GetSystemStatus)
+		unSecureAdminGroup.GET("/system/profile", func(c *gin.Context) { c.JSON(200, gin.H{"personalMode": personalMode()}) })
 		unSecureAdminGroup.POST("/system/initialize", handlers.System.InitializeSystem)
 		// User Login - DO NOT AUTH
 		unSecureAdminGroup.POST("/auth/signin", handlers.Auth.SignIn)
@@ -97,7 +101,9 @@ func SetupRoutes(server *Server, handlers Handlers, client *ent.Client, services
 
 	oauthGroup := server.Group("/oauth", middleware.WithTimeout(server.Config.RequestTimeout))
 	{
-		handlers.OIDC.RegisterRoutes(oauthGroup)
+		if !personalMode() {
+			handlers.OIDC.RegisterRoutes(oauthGroup)
+		}
 	}
 
 	adminGroup := server.Group("/admin", middleware.WithJWTAuth(services.AuthService), middleware.WithProjectID())
@@ -106,10 +112,13 @@ func SetupRoutes(server *Server, handlers Handlers, client *ent.Client, services
 		adminGroup.GET("/playground", middleware.WithTimeout(server.Config.RequestTimeout), func(c *gin.Context) {
 			handlers.Graphql.Playground.ServeHTTP(c.Writer, c.Request)
 		})
-		adminGroup.POST("/graphql", middleware.WithTimeout(server.Config.RequestTimeout), func(c *gin.Context) {
+		adminGroup.POST("/graphql", personalGraphQLGuard(), middleware.WithTimeout(server.Config.RequestTimeout), func(c *gin.Context) {
 			handlers.Graphql.Graphql.ServeHTTP(c.Writer, c.Request)
 		})
-		adminGroup.POST("/invitations", handlers.Invitation.Create)
+		if !personalMode() {
+			adminGroup.POST("/invitations", handlers.Invitation.Create)
+		}
+		registerPersonalRoutes(adminGroup, services.ChannelService)
 
 		adminGroup.POST("/codex/oauth/start", handlers.Codex.StartOAuth)
 		adminGroup.POST("/codex/oauth/exchange", handlers.Codex.Exchange)
@@ -157,7 +166,7 @@ func SetupRoutes(server *Server, handlers Handlers, client *ent.Client, services
 		middleware.WithTimeout(server.Config.RequestTimeout),
 	)
 	{
-		openAPIGroup.POST("/v1/graphql", func(c *gin.Context) {
+		openAPIGroup.POST("/v1/graphql", personalGraphQLGuard(), func(c *gin.Context) {
 			handlers.OpenAPIGraphql.Graphql.ServeHTTP(c.Writer, c.Request)
 		})
 		openAPIGroup.GET("/v1/playground", func(c *gin.Context) {

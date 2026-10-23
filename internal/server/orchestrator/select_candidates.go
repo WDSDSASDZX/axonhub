@@ -82,6 +82,10 @@ func selectCandidates(inbound *PersistentInboundTransformer, quotaProvider Provi
 		if err != nil {
 			return nil, err
 		}
+		candidates, err = applyPersonalPolicy(candidates, llmRequest.Model)
+		if err != nil {
+			return nil, err
+		}
 
 		if log.DebugEnabled(ctx) {
 			log.Debug(ctx, "selected candidates",
